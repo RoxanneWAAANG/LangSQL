@@ -1,65 +1,60 @@
 import torch
 import torch.nn as nn
 
-from transformers import AutoConfig, RobertaModel, XLMRobertaModel
+from transformers import AutoConfig, RobertaModel
 
-class MyClassifier(nn.Module):
-    def __init__(
-        self,
-        model_name_or_path,
-        vocab_size,
-        mode
-    ):
-        super(MyClassifier, self).__init__()
-        model_class = XLMRobertaModel if "xlm" in model_name_or_path else RobertaModel
+class SchemaItemClassifier(nn.Module):
+    def __init__(self, model_name_or_path, mode):
+        super(SchemaItemClassifier, self).__init__()
         if mode in ["eval", "test"]:
             # load config
             config = AutoConfig.from_pretrained(model_name_or_path)
             # randomly initialize model's parameters according to the config
-            self.plm_encoder = model_class(config)
+            self.plm_encoder = RobertaModel(config)
         elif mode == "train":
-            self.plm_encoder = model_class.from_pretrained(model_name_or_path)
-            self.plm_encoder.resize_token_embeddings(vocab_size)
+            self.plm_encoder = RobertaModel.from_pretrained(model_name_or_path)
         else:
             raise ValueError()
 
+        self.plm_hidden_size = self.plm_encoder.config.hidden_size
+
         # column cls head
-        self.column_info_cls_head_linear1 = nn.Linear(1024, 256)
+        self.column_info_cls_head_linear1 = nn.Linear(self.plm_hidden_size, 256)
         self.column_info_cls_head_linear2 = nn.Linear(256, 2)
         
         # column bi-lstm layer
         self.column_info_bilstm = nn.LSTM(
-            input_size = 1024,
-            hidden_size = 512,
+            input_size = self.plm_hidden_size,
+            hidden_size = int(self.plm_hidden_size/2),
             num_layers = 2,
             dropout = 0,
             bidirectional = True
         )
 
         # linear layer after column bi-lstm layer
-        self.column_info_linear_after_pooling = nn.Linear(1024, 1024)
+        self.column_info_linear_after_pooling = nn.Linear(self.plm_hidden_size, self.plm_hidden_size)
 
         # table cls head
-        self.table_name_cls_head_linear1 = nn.Linear(1024, 256)
+        self.table_name_cls_head_linear1 = nn.Linear(self.plm_hidden_size, 256)
         self.table_name_cls_head_linear2 = nn.Linear(256, 2)
         
         # table bi-lstm pooling layer
         self.table_name_bilstm = nn.LSTM(
-            input_size = 1024,
-            hidden_size = 512,
+            input_size = self.plm_hidden_size,
+            hidden_size = int(self.plm_hidden_size/2),
             num_layers = 2,
             dropout = 0,
             bidirectional = True
         )
         # linear layer after table bi-lstm layer
-        self.table_name_linear_after_pooling = nn.Linear(1024, 1024)
+        self.table_name_linear_after_pooling = nn.Linear(self.plm_hidden_size, self.plm_hidden_size)
 
         # activation function
         self.leakyrelu = nn.LeakyReLU()
         self.tanh = nn.Tanh()
 
         # table-column cross-attention layer
-        self.table_column_cross_attention_layer = nn.MultiheadAttention(embed_dim = 1024, num_heads = 8)
+        self.table_column_cross_attention_layer = nn.MultiheadAttention(embed_dim = self.plm_hidden_size, num_heads = 8)
 
         # dropout function, p=0.2 means randomly set 20% neurons to 0
         self.dropout = nn.Dropout(p = 0.2)
@@ -96,7 +91,6 @@ class MyClassifier(nn.Module):
         self,
         encoder_input_ids,
         encoder_input_attention_mask,
-        batch_aligned_question_ids,
         batch_aligned_column_info_ids,
         batch_aligned_table_name_ids,
         batch_column_number_in_each_table
@@ -115,9 +109,6 @@ class MyClassifier(nn.Module):
         for batch_id in range(batch_size):
             column_number_in_each_table = batch_column_number_in_each_table[batch_id]
             sequence_embeddings = encoder_output["last_hidden_state"][batch_id, :, :] # (seq_length x hidden_size)
-            
-            # obtain the embeddings of tokens in the question
-            question_token_embeddings = sequence_embeddings[batch_aligned_question_ids[batch_id], :]
 
             # obtain table ids for each table
             aligned_table_name_ids = batch_aligned_table_name_ids[batch_id]
@@ -132,7 +123,7 @@ class MyClassifier(nn.Module):
                 
                 # BiLSTM pooling
                 output_t, (hidden_state_t, cell_state_t) = self.table_name_bilstm(table_name_embeddings)
-                table_name_embedding = hidden_state_t[-2:, :].view(1, 1024)
+                table_name_embedding = hidden_state_t[-2:, :].view(1, self.plm_hidden_size)
                 table_name_embedding_list.append(table_name_embedding)
             table_name_embeddings_in_one_db = torch.cat(table_name_embedding_list, dim = 0)
             # non-linear mlp layer
@@ -144,7 +135,7 @@ class MyClassifier(nn.Module):
                 
                 # BiLSTM pooling
                 output_c, (hidden_state_c, cell_state_c) = self.column_info_bilstm(column_info_embeddings)
-                column_info_embedding = hidden_state_c[-2:, :].view(1, 1024)
+                column_info_embedding = hidden_state_c[-2:, :].view(1, self.plm_hidden_size)
                 column_info_embedding_list.append(column_info_embedding)
             column_info_embeddings_in_one_db = torch.cat(column_info_embedding_list, dim = 0)
             # non-linear mlp layer
@@ -176,19 +167,17 @@ class MyClassifier(nn.Module):
         self,
         encoder_input_ids,
         encoder_attention_mask,
-        batch_aligned_question_ids,
         batch_aligned_column_info_ids,
         batch_aligned_table_name_ids,
         batch_column_number_in_each_table,
     ):  
         batch_table_name_cls_logits, batch_column_info_cls_logits \
             = self.table_column_cls(
-            encoder_input_ids,
-            encoder_attention_mask,
-            batch_aligned_question_ids,
-            batch_aligned_column_info_ids,
-            batch_aligned_table_name_ids,
-            batch_column_number_in_each_table
+                encoder_input_ids,
+                encoder_attention_mask,
+                batch_aligned_column_info_ids,
+                batch_aligned_table_name_ids,
+                batch_column_number_in_each_table
         )
 
         return {
