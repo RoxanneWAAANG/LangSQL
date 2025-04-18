@@ -1,156 +1,225 @@
 import json
 import numpy as np
+import re
+import os
+import time
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, MultiLabelBinarizer
+import pickle
 
 class ML_Text2SQL:
     def __init__(self):
-        # Vectorizer for question text
-        self.question_vectorizer = TfidfVectorizer(max_features=100, ngram_range=(1, 2))
-        
-        # Classifiers for SQL components
-        self.table_classifier = RandomForestClassifier(n_estimators=50, random_state=42)
-        self.operation_classifier = RandomForestClassifier(n_estimators=50, random_state=42)
-        
-        # Operation labels
-        self.operations = ["SELECT", "COUNT", "MAX", "MIN", "AVG"]
+        self.vectorizer = TfidfVectorizer(max_features=200, ngram_range=(1, 3))
+        self.table_classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.operation_classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.join_classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.condition_classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.order_classifier = RandomForestClassifier(n_estimators=100, random_state=42)
         self.operation_encoder = LabelEncoder()
-    
+        self.table_encoder = MultiLabelBinarizer()  # Added to handle multiple table labels
+        self.operations = ["SELECT", "COUNT", "MAX", "MIN", "AVG", "SUM"]
+        self.is_fitted = False
+        
     def extract_features(self, question, schema):
-        """Extract features from question and schema."""
-        # Text features from question
-        if not hasattr(self.question_vectorizer, 'vocabulary_'):
-            question_features = np.zeros(100)
-        else:
-            question_features = self.question_vectorizer.transform([question]).toarray()[0]
+        """Extract features from the question and schema."""
+        question_features = self.vectorizer.transform([question]).toarray().flatten() if self.is_fitted else np.zeros(self.vectorizer.max_features)
+        schema_features = np.array([int(table["table_name"].lower() in question.lower()) for table in schema["schema_items"]])
         
-        # Schema features - check if tables/columns are mentioned
-        schema_features = []
-        question = question.lower()
+        pattern_features = np.array([
+            int(any(keyword in question.lower() for keyword in ['count', 'how many'])),
+            int(any(keyword in question.lower() for keyword in ['maximum', 'highest', 'most'])),
+            int(any(keyword in question.lower() for keyword in ['minimum', 'lowest', 'least'])),
+            int(any(keyword in question.lower() for keyword in ['average', 'mean'])),
+            int(any(keyword in question.lower() for keyword in ['total', 'sum'])),
+            int(any(keyword in question.lower() for keyword in ['order', 'sort'])),
+            int(any(keyword in question.lower() for keyword in ['limit', 'top', 'first'])),
+            int(any(keyword in question.lower() for keyword in ['group', 'each'])),
+            int(any(keyword in question.lower() for keyword in ['greater', 'more than', 'larger'])),
+            int(any(keyword in question.lower() for keyword in ['less', 'smaller', 'lower', 'fewer'])),
+            int(any(keyword in question.lower() for keyword in ['equal', 'same as', 'is'])),
+            int(any(keyword in question.lower() for keyword in ['join', 'and', 'with']))
+        ])
         
-        for item in schema["schema_items"]:
-            table_name = item["table_name"].lower()
-            table_mentioned = int(table_name in question or f"{table_name}s" in question)
-            schema_features.append(table_mentioned)
+        return np.concatenate([question_features, schema_features, pattern_features])
+
+    def fit(self, training_data):
+        """Train the model."""
+        if not training_data:
+            raise ValueError("No training data provided.")
         
-        # Pattern features
-        pattern_features = [
-            int(any(p in question for p in ["how many", "number", "count", "total"])),
-            int(any(p in question for p in ["maximum", "highest", "largest"])),
-            int(any(p in question for p in ["minimum", "lowest", "smallest"]))
-        ]
+        print("Training model...")
+        questions = [example["question"] for example in training_data]
+        self.vectorizer.fit(questions)
+        self.is_fitted = True
         
-        return np.concatenate([question_features, np.array(schema_features), np.array(pattern_features)])
-    
+        # Extract features and ensure consistent shape
+        features = []
+        max_feature_length = None
+        
+        for example in training_data:
+            feature_vector = self.extract_features(example["question"], example["schema"])
+            
+            # Store the maximum feature length
+            if max_feature_length is None:
+                max_feature_length = len(feature_vector)
+            elif len(feature_vector) != max_feature_length:
+                # Ensure features are consistent in length
+                if len(feature_vector) < max_feature_length:
+                    feature_vector = np.pad(feature_vector, (0, max_feature_length - len(feature_vector)))
+                else:
+                    feature_vector = feature_vector[:max_feature_length]
+            
+            features.append(feature_vector)
+        
+        X = np.array(features)  # Convert list of consistent-sized features to numpy array
+        
+        # Prepare labels for training
+        y_operations = []
+        
+        # Extract operations from SQL queries
+        for example in training_data:
+            y_operations.append(self._extract_operation(example["sql"]))
+        
+        y_operations_encoded = self.operation_encoder.fit_transform(y_operations)
+        
+        # Use MultiLabelBinarizer for table labels
+        y_tables = [example["table_labels"] for example in training_data]
+        y_tables_encoded = self.table_encoder.fit_transform(y_tables)
+        
+        y_join = [int("JOIN" in example["sql"].upper()) for example in training_data]
+        y_condition = [int("WHERE" in example["sql"].upper()) for example in training_data]
+        y_order = [int("ORDER BY" in example["sql"].upper()) for example in training_data]
+        
+        print(f"Training classifiers with feature matrix shape: {X.shape}")
+        print(f"Table labels shape after encoding: {y_tables_encoded.shape}")
+        
+        # Fit the classifiers with properly encoded table labels
+        self.table_classifier.fit(X, y_tables_encoded)
+        self.operation_classifier.fit(X, y_operations_encoded)
+        self.join_classifier.fit(X, y_join)
+        self.condition_classifier.fit(X, y_condition)
+        self.order_classifier.fit(X, y_order)
+        
+        print("Model training complete.")
+
+    def predict(self, question, schema):
+        """Predict SQL query from the question."""
+        features = self.extract_features(question, schema)
+        
+        # Ensure consistent feature length
+        expected_length = self.table_classifier.n_features_in_
+        features = np.pad(features, (0, expected_length - len(features))) if len(features) < expected_length else features[:expected_length]
+        
+        operation_idx = self.operation_classifier.predict([features])[0]
+        predicted_operation = self.operation_encoder.inverse_transform([operation_idx])[0]
+        
+        has_join = self.join_classifier.predict([features])[0]
+        has_condition = self.condition_classifier.predict([features])[0]
+        has_order = self.order_classifier.predict([features])[0]
+        
+        # Get binary prediction and convert back to class labels
+        pred_tables_encoded = self.table_classifier.predict([features])[0]
+        table_indices = np.where(pred_tables_encoded == 1)[0]
+        
+        # If no tables were predicted, fall back to schema-based selection
+        if len(table_indices) == 0:
+            schema_features = np.array([int(table["table_name"].lower() in question.lower()) for table in schema["schema_items"]])
+            table_indices = np.where(schema_features == 1)[0]
+            
+            # If still no tables found, use the first table
+            if len(table_indices) == 0 and len(schema["schema_items"]) > 0:
+                table_indices = [0]
+                
+        # Convert indices to actual table names
+        tables = [schema["schema_items"][i]["table_name"] for i in table_indices if i < len(schema["schema_items"])]
+        
+        # Fallback if no tables were found
+        tables = tables or ["unknown_table"]
+        
+        return self._generate_sql(predicted_operation, tables, has_join, has_condition, has_order, question)
+
     def _extract_operation(self, sql):
-        """Extract main SQL operation."""
+        """Extract operation (SELECT, COUNT, etc.) from SQL."""
         sql_upper = sql.upper()
         for op in self.operations:
             if op in sql_upper:
                 return op
         return "SELECT"
     
-    def fit(self, training_data):
-        """Train ML model on training data."""
-        if not training_data:
-            print("Error: No training data provided.")
-            return
-            
-        # Prepare training data
-        X_questions = []
-        y_tables = []
-        y_operations = []
+    def _generate_sql(self, operation, tables, has_join, has_condition, has_order, question):
+        """Generate SQL query from predicted components."""
+        sql = f"SELECT * FROM {tables[0]}" if operation == "SELECT" else f"SELECT {operation}(*) FROM {tables[0]}"
         
-        for example in training_data:
-            X_questions.append(example["question"])
-            y_tables.append(example["table_labels"])
-            y_operations.append(self._extract_operation(example["sql"]))
+        if has_join and len(tables) > 1:
+            sql += f" JOIN {tables[1]} ON {tables[0]}.{tables[0]}_id = {tables[1]}.{tables[0]}_id"
         
-        # Fit question vectorizer
-        self.question_vectorizer.fit(X_questions)
+        if has_condition:
+            numbers = re.findall(r'\d+', question)
+            sql += f" WHERE {tables[0]}_id > {numbers[0]}" if numbers else f" WHERE {tables[0]}_id IS NOT NULL"
         
-        # Extract full feature vectors
-        X = [self.extract_features(ex["question"], ex["schema"]) for ex in training_data]
-        X = np.array(X)
-        y_tables = np.array(y_tables)
+        if has_order:
+            sql += f" ORDER BY {operation}(*) DESC" if "highest" in question.lower() else f" ORDER BY {operation}(*) ASC"
+            if "top" in question.lower():
+                sql += " LIMIT 1"
         
-        # Fit operation encoder and encode labels
-        self.operation_encoder.fit(y_operations)
-        y_operations_encoded = self.operation_encoder.transform(y_operations)
-        
-        # Train classifiers
-        self.table_classifier.fit(X, y_tables)
-        self.operation_classifier.fit(X, y_operations_encoded)
+        return sql
     
-    def predict(self, question, schema):
-        """Predict SQL query for a question."""
-        # Extract features
-        features = self.extract_features(question, schema)
-        
-        # Predict tables and operation
-        predicted_tables = self.table_classifier.predict([features])[0]
-        operation_idx = self.operation_classifier.predict([features])[0]
-        predicted_operation = self.operation_encoder.inverse_transform([operation_idx])[0]
-        
-        # Build SQL query based on predictions
-        used_tables = []
-        for i, used in enumerate(predicted_tables):
-            if used == 1 and i < len(schema["schema_items"]):
-                used_tables.append(schema["schema_items"][i]["table_name"])
-        
-        # If no tables predicted, use first table
-        if not used_tables and schema["schema_items"]:
-            used_tables = [schema["schema_items"][0]["table_name"]]
-        
-        # Generate SQL based on operation
-        if predicted_operation == "COUNT" and used_tables:
-            return f"SELECT COUNT(*) FROM {used_tables[0]}"
-        elif used_tables:
-            return f"SELECT * FROM {used_tables[0]}"
-        
-        # Fallback query
-        return "SELECT * FROM singer LIMIT 5"
+    def save_model(self, model_path):
+        """Save the trained model to disk."""
+        # os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        with open(model_path, 'wb') as f:
+            pickle.dump(self, f)
+        print(f"Model saved to {model_path}")
+    
+    @classmethod
+    def load_model(cls, model_path):
+        """Load a trained model from disk."""
+        with open(model_path, 'rb') as f:
+            return pickle.load(f)
 
-# Example usage
-if __name__ == "__main__":
+def main():
+    """Main function to train and evaluate the model."""
+    data_path = "/home/jack/Projects/yixin-llm/yixin-llm-data/Text2SQL/data/sft_spider_dev_text2sql.json"
+    model_save_path = "ml_text2sql_model.pkl"
+    
+    # Load data
     try:
-        with open("/home/jack/Projects/yixin-llm/Text2SQL/dataset/sample_spider_data.json", "r") as f:
+        with open(data_path, "r") as f:
             data = json.load(f)
-        print(f"Loaded dataset with {len(data)} examples")
+        print(f"Loaded {len(data)} examples.")
     except (FileNotFoundError, json.JSONDecodeError) as e:
         print(f"Error loading data: {e}")
-        exit(1)
+        return
     
-    # Split data for training and testing
-    train_size = max(1, int(len(data) * 0.8))
-    train_data = data[:train_size]
-    test_data = data[train_size:]
+    # Split data into training and testing sets
+    train_size = int(len(data) * 0.8)
+    train_data, test_data = data[:train_size], data[train_size:]
     
-    # Create and train ML model
-    ml_model = ML_Text2SQL()
-    ml_model.fit(train_data)
+    # Initialize and train the model
+    model = ML_Text2SQL()
+    model.fit(train_data)
+    model.save_model(model_save_path)
     
-    # Test on examples
+    # Evaluate model on test set
     correct = 0
-    for i, example in enumerate(test_data):
-        question = example["question"]
-        schema = example["schema"]
-        true_sql = example["sql"]
-        
-        predicted_sql = ml_model.predict(question, schema)
-        
-        print(f"Example {i+1}:")
-        print(f"Question: {question}")
-        print(f"True SQL: {true_sql}")
-        print(f"Predicted SQL: {predicted_sql}")
-        
-        if predicted_sql.lower() == true_sql.lower():
-            correct += 1
-            print("Correct: Yes")
-        else:
-            print("Correct: No")
-        print("---")
+    total = len(test_data)
+    results = []
     
-    if test_data:
-        print(f"Accuracy: {correct / len(test_data):.2f}")
+    for i, example in enumerate(test_data):
+        question, schema, true_sql = example["question"], example["schema"], example["sql"]
+        predicted_sql = model.predict(question, schema)
+        
+        is_correct = predicted_sql.lower() == true_sql.lower()
+        correct += is_correct
+        results.append({"id": i, "question": question, "true_sql": true_sql, "predicted_sql": predicted_sql, "is_correct": is_correct})
+    
+    accuracy = correct / total
+    print(f"Final accuracy: {accuracy:.4f}")
+    
+    # Save evaluation results
+    with open("evaluation_results.json", 'w') as f:
+        json.dump({"accuracy": accuracy, "results": results}, f, indent=2)
+
+if __name__ == "__main__":
+    main()
