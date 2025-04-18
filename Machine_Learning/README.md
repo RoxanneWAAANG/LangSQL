@@ -1,9 +1,7 @@
 # Text2SQL -- Machine Learning Approach
 
-# ML_Text2SQL README
-
 ## Overview
-`ML_Text2SQL` is a machine learning-based tool that converts natural language questions into SQL queries. The model is trained to extract features from text input (questions) and a database schema, then generate corresponding SQL queries using classification techniques. This tool is built using scikit-learn's RandomForestClassifier and other machine learning methods to process the input data and generate SQL commands such as `SELECT`, `COUNT`, `MAX`, `MIN`, etc.
+The machine learning model is trained to extract features from text input (questions) and a database schema, then generate corresponding SQL queries using classification techniques. This tool is built using scikit-learn's RandomForestClassifier and other machine learning methods to process the input data and generate SQL commands such as `SELECT`, `COUNT`, `MAX`, `MIN`, etc.
 
 ## Features
 - **Text-to-SQL Conversion**: Converts natural language questions to SQL queries.
