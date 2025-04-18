@@ -1,4 +1,4 @@
-# Text2SQL -- Naive Model
+# Text2SQL -- Naive Approach
 
 ## Overview
 The naive model is a rule-based approach to converting natural language questions into SQL queries. This model uses pattern matching and predefined templates to generate SQL queries without the need for training data. It serves as a baseline model for text-to-SQL tasks, focusing on basic query types such as `COUNT`, `MAX`, `MIN`, `AVG`, and `SELECT`.
