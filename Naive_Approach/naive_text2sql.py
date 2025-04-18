@@ -1,5 +1,3 @@
-# naive_text2sql.py
-
 import json
 import os
 import re
@@ -133,7 +131,7 @@ class NaiveText2SQL:
 # Example usage
 if __name__ == "__main__":
     # Load sample data
-    with open("/home/jack/Projects/yixin-llm/Text2SQL/dataset/sample_spider_data.json", "r") as f:
+    with open("/home/jack/Projects/yixin-llm/yixin-llm-data/Text2SQL/data/sft_spider_dev_text2sql.json", "r") as f:
         data = json.load(f)
     
     # Create the naive model
