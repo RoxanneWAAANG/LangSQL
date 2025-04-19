@@ -113,14 +113,14 @@ def get_db_id2ddl(db_path):
 class ChatBot():
     def __init__(self) -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-        model_name = "seeklhy/codes-7b-merged"
+        model_name = "seeklhy/codes-1b"
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(model_name, device_map = "auto", torch_dtype = torch.float16)
         self.max_length = 4096
         self.max_new_tokens = 256
         self.max_prefix_length = self.max_length - self.max_new_tokens
 
-        self.sic = SchemaItemClassifierInference("sic_ckpts/sic_bird")
+        self.sic = SchemaItemClassifierInference("/home/jack/Projects/yixin-llm/yixin-llm-data/Text2SQL/sic_ckpts/sic_spider")
 
         self.db_id2content_searcher = dict()
         for db_id in os.listdir("db_contents_index"):
