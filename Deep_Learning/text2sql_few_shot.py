@@ -14,17 +14,17 @@ from transformers.trainer_utils import set_seed
 
 def parse_option():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--llm_path', type = str)
-    parser.add_argument('--sic_path', type = str)
+    parser.add_argument('--llm_path', type = str, default = "seeklhy/codes-1b")
+    parser.add_argument('--sic_path', type = str, default = "/home/jack/Projects/yixin-llm/yixin-llm-data/Text2SQL/sic_ckpts/sic_spider")
     parser.add_argument('--table_num', type = int, default = 5)
     parser.add_argument('--column_num', type = int, default = 6)
     
-    parser.add_argument('--dataset_path', type = str)
-    parser.add_argument('--demonstration_set_path', type = str)
-    parser.add_argument('--num_of_demonstrations', type = int)
+    parser.add_argument('--dataset_path', type = str, default = "/home/jack/Projects/yixin-llm/Text2SQL/dataset/sample_spider_data.json")
+    parser.add_argument('--demonstration_set_path', type = str, default = "/home/jack/Projects/yixin-llm/yixin-llm-data/Text2SQL/data/sft_spider_train_text2sql.json")
+    parser.add_argument('--num_of_demonstrations', type = int, default = 1)
 
-    parser.add_argument('--max_tokens', type = int)
-    parser.add_argument('--max_new_tokens', type = int)
+    parser.add_argument('--max_tokens', type = int, default = 8192)
+    parser.add_argument('--max_new_tokens', type = int, default = 256)
 
     opt = parser.parse_args()
 
