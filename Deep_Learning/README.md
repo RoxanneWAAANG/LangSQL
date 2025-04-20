@@ -8,9 +8,7 @@ In this project, I leverage CodeS-1B, fine-tuned for translating natural languag
 
 ## Features
 - **CodeS Model Integration**: The CodeS model is fine-tuned for Text-to-SQL tasks, providing accurate SQL query generation.
-
 - **Schema Item Filtering**: A schema item classifier is used to filter relevant schema items, improving the SQL generation process.
-
 - **Model Evaluation**: Model evaluated using two benchmarks, including Spider and BIRD, to assess the accuracy of generated SQL queries.
 
 
