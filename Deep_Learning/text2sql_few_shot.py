@@ -1,262 +1,230 @@
+# Attribution: Original code by RUCKBReasoning
+# Repository: https://github.com/RUCKBReasoning/codes
+
+"""
+Few-shot cross-domain text-to-SQL generation and evaluation pipeline.
+
+Attribution:
+- HuggingFace Transformers: https://github.com/huggingface/transformers
+- SimCSE: https://github.com/princeton-nlp/SimCSE
+"""
 import argparse
-from utils.db_utils import check_sql_executability, get_db_schema_sequence, get_matched_content_sequence, detect_special_char
-import os
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
+import os
+import time
+from typing import List, Dict
+
 import nltk
-import random
 import numpy as np
-from schema_item_filter import SchemaItemClassifierInference, filter_schema
 import torch
-from tqdm import tqdm
-from simcse import SimCSE
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.trainer_utils import set_seed
+from tqdm import tqdm
 
-def parse_option():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--llm_path', type = str, default = "seeklhy/codes-1b")
-    parser.add_argument('--sic_path', type = str, default = "/home/jack/Projects/yixin-llm/yixin-llm-data/Text2SQL/sic_ckpts/sic_spider")
-    parser.add_argument('--table_num', type = int, default = 5)
-    parser.add_argument('--column_num', type = int, default = 6)
-    
-    parser.add_argument('--dataset_path', type = str, default = "/home/jack/Projects/yixin-llm/Text2SQL/dataset/sample_spider_data.json")
-    parser.add_argument('--demonstration_set_path', type = str, default = "/home/jack/Projects/yixin-llm/yixin-llm-data/Text2SQL/data/sft_spider_train_text2sql.json")
-    parser.add_argument('--num_of_demonstrations', type = int, default = 1)
+from simcse import SimCSE
+from schema_item_filter import SchemaItemClassifierInference, filter_schema
+from utils.db_utils import (
+    check_sql_executability,
+    detect_special_char,
+    get_db_schema_sequence,
+    get_matched_content_sequence
+)
+from utils.load_sft_dataset import SFTSQLGenerationDataset
 
-    parser.add_argument('--max_tokens', type = int, default = 8192)
-    parser.add_argument('--max_new_tokens', type = int, default = 256)
 
-    opt = parser.parse_args()
-
-    return opt
-
-def post_process(sql, schema_items):
-    sql = sql.replace("\n", " ")
-    for table in schema_items:
-        for column_name in table["column_names"]:
-            if detect_special_char(column_name) and column_name in sql:
-                sql = sql.replace(column_name, "`"+column_name+"`")
-
-    while "``" in sql:
-        sql = sql.replace("``", "`")
-
-    sql = sql.split(";")[0].strip() + ";"
-
-    return sql
-
-# extract the skeleton of the input text
-def extract_skeleton(text):
-    tokens_and_tags = nltk.pos_tag(nltk.word_tokenize(text))
-
-    output_tokens = []
-    for token, tag in tokens_and_tags:
-        if tag in ['NN', 'NNP', 'NNS', 'NNPS', 'CD', 'SYM', 'FW', 'IN']:
-            output_tokens.append("_")
-        elif token in ['$', "''", '(', ')', ',', '--', '.', ':']:
-            pass
-        else:
-            output_tokens.append(token)
-    
-    text_skeleton = " ".join(output_tokens)
-    text_skeleton = text_skeleton.replace("_ 's", "_")
-    text_skeleton = text_skeleton.replace(" 's", "'s")
-
-    while("_ _" in text_skeleton):
-        text_skeleton = text_skeleton.replace("_ _", "_")
-    while("_ , _" in text_skeleton):
-        text_skeleton = text_skeleton.replace("_ , _", "_")
-    
-    if text_skeleton.startswith("_ "):
-        text_skeleton = text_skeleton[2:]
-    
-    return text_skeleton
-
-def prepare_input_ids_and_attention_mask(tokenizer, input_seq, max_input_length, device):
-    input_ids = tokenizer(input_seq , truncation = False)["input_ids"]
-
-    if len(input_ids) <= max_input_length:
-        input_ids = input_ids
-        attention_mask = [1] * len(input_ids)
-    else:
-        if tokenizer.name_or_path == "THUDM/codegeex2-6b":
-            input_ids = [64790, 64792] + input_ids[-(max_input_length-2):]
-        else:
-            input_ids = [tokenizer.bos_token_id] + input_ids[-(max_input_length-1):]
-
-        attention_mask = [1] * max_input_length
-    
-    print("len(input_ids):", len(input_ids))
- 
-    return {
-        "input_ids": torch.tensor([input_ids]).to(device), # torch.int64
-        "attention_mask": torch.tensor([attention_mask]).to(device) # torch.int64
-    }
-
-def prepare_cross_domain_input_seq(opt, eval_data, demonstration_set, similarity):
-    top_k_indices = sorted(range(len(similarity)), key = lambda x: similarity[x], reverse = True)[:opt.num_of_demonstrations]
-    # top_k_indices = list(reversed(top_k_indices))
-    # top_k_indices = random.sample(range(len(similarity)), opt.num_of_demonstrations)
-    print(top_k_indices)
-    print(similarity[top_k_indices])
-
-    input_seq = ""
-    for idx in top_k_indices:
-        demonstration_sql = demonstration_set[idx]["sql"]
-        if demonstration_sql.endswith(";"):
-            demonstration_sql = demonstration_sql[:-1].strip() + " ;"
-        else:
-            demonstration_sql = demonstration_sql.strip() + " ;"
-
-        input_seq += demonstration_set[idx]["schema_sequence"] + "\n" + demonstration_set[idx]["content_sequence"] + "\n" + \
-            demonstration_set[idx]["text"] + "\n" + demonstration_sql + "\n\n"
-
-    input_seq += eval_data["schema_sequence"] + "\n" + eval_data["content_sequence"] + "\n" + eval_data["text"] + "\n"
-    # print(input_seq)
-    # print("-"*30)
-
-    return input_seq
-
-def text2sql_func(model, text2sql_input_seq, tokenizer, max_tokens, max_new_tokens, eos_token_id):
-    inputs = prepare_input_ids_and_attention_mask(
-        tokenizer, 
-        text2sql_input_seq, 
-        max_tokens - max_new_tokens,
-        model.device
+def parse_args() -> argparse.Namespace:
+    """
+    Parse CLI arguments for model, data, and generation settings.
+    """
+    parser = argparse.ArgumentParser(
+        description="Few-shot cross-domain text-to-SQL pipeline"
     )
+    parser.add_argument('--llm_path', type=str, default='seeklhy/codes-1b',
+                        help='Model path or HuggingFace ID')
+    parser.add_argument('--sic_path', type=str, required=True,
+                        help='Schema-item classifier checkpoint path')
+    parser.add_argument('--table_num', type=int, default=5,
+                        help='Max tables in context')
+    parser.add_argument('--column_num', type=int, default=6,
+                        help='Max columns per table')
+    parser.add_argument('--dataset_path', type=str, required=True,
+                        help='Path to eval JSON dataset')
+    parser.add_argument('--demonstration_set_path', type=str, required=True,
+                        help='Path to demonstration JSON pool')
+    parser.add_argument('--num_of_demonstrations', type=int, default=1,
+                        help='Number of few-shot examples')
+    parser.add_argument('--max_tokens', type=int, default=8192,
+                        help='Input token limit')
+    parser.add_argument('--max_new_tokens', type=int, default=256,
+                        help='Generated token limit')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed')
+    return parser.parse_args()
 
-    input_length = inputs["input_ids"].shape[1]
 
-    # check_tokenizer(tokenizer, inputs["input_ids"])
+class SQLPostProcessor:
+    """
+    Clean and finalize generated SQL for execution.
+    """
+    @staticmethod
+    def clean(sql: str, schema_items: List[Dict]) -> str:
+        # Remove newlines
+        sql = sql.replace('\n', ' ')
+        # Quote special columns
+        for table in schema_items:
+            for col in table.get('column_names', []):
+                if detect_special_char(col) and col in sql:
+                    sql = sql.replace(col, f'`{col}`')
+        # Collapse double backticks
+        while '``' in sql:
+            sql = sql.replace('``', '`')
+        # Keep only first statement and terminate
+        stmt = sql.split(';')[0].strip()
+        return stmt + ';'
 
-    with torch.no_grad():
-        generate_ids = model.generate(
-            **inputs,
-            max_new_tokens = max_new_tokens,
-            num_beams = 4,
-            num_return_sequences = 4,
-            use_cache = True,
-            eos_token_id = eos_token_id
+
+class SkeletonExtractor:
+    """
+    Extracts a simplified POS-based skeleton from text.
+    """
+    @staticmethod
+    def extract(text: str) -> str:
+        tokens_tags = nltk.pos_tag(nltk.word_tokenize(text))
+        out = []
+        for tok, tag in tokens_tags:
+            if tag in ('NN','NNP','NNS','NNPS','CD','SYM','FW','IN'):
+                out.append('_')
+            elif tok in {'$','"','(',')',',','--','.',':'}:
+                continue
+            else:
+                out.append(tok)
+        skeleton = ' '.join(out).replace("_ 's", '_').replace(" 's", "'s")
+        # remove repeats
+        while '_ _' in skeleton:
+            skeleton = skeleton.replace('_ _', '_')
+        return skeleton.lstrip('_ ')
+
+
+class DemonstrationSelector:
+    """
+    Selects top-k similar demonstrations for few-shot prompting.
+    """
+    def __init__(self, simcse_model: SimCSE, k: int):
+        self.model = simcse_model
+        self.k = k
+
+    def select(self, eval_qs: List[str], demo_qs: List[str]) -> List[List[int]]:
+        # Compute raw and skeleton similarities, then take max
+        sim_raw = self.model.similarity(eval_qs, demo_qs)
+        sims = []
+        for i, q in enumerate(eval_qs):
+            sims_sk = self.model.similarity([
+                SkeletonExtractor.extract(q)
+            ], [SkeletonExtractor.extract(demo_qs[j]) for j in range(len(demo_qs))])[0]
+            sims.append(np.maximum(sim_raw[i], sims_sk))
+        return [list(np.argsort(-s)[:self.k]) for s in sims]
+
+
+class Text2SQLGenerator:
+    """
+    Handles model loading and generation.
+    """
+    def __init__(self, model_path: str, max_new_tokens: int):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path, device_map='auto', torch_dtype=torch.float16
+        )
+        self.model.eval()
+        self.max_new_tokens = max_new_tokens
+        self.device = next(self.model.parameters()).device
+        # adjust eos token for SQL termination
+        ids = self.tokenizer('SELECT * FROM tables ;')['input_ids']
+        new_eos = ids[-2] if ids[-1] == self.tokenizer.eos_token_id else ids[-1]
+        self.model.config.eos_token_id = new_eos
+        self.tokenizer.eos_token_id = new_eos
+
+    def generate(self, prompt: str, max_input_len: int) -> List[str]:
+        ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0].tolist()
+        if len(ids) > max_input_len:
+            ids = [self.tokenizer.bos_token_id] + ids[-(max_input_len-1):]
+        input_ids = torch.tensor([ids], device=self.device)
+        mask = torch.ones_like(input_ids)
+        out = self.model.generate(
+            input_ids=input_ids, attention_mask=mask,
+            max_new_tokens=self.max_new_tokens,
+            num_beams=4, num_return_sequences=4
+        )
+        return self.tokenizer.batch_decode(
+            out[:, input_ids.size(1):],
+            skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
 
-    generated_sqls = tokenizer.batch_decode(generate_ids[:, input_length:], skip_special_tokens = True, clean_up_tokenization_spaces = False)
 
-    return generated_sqls
+class EvaluationPipeline:
+    """
+    Orchestrates data loading, demonstration prep, generation, and evaluation.
+    """
+    def __init__(self, args: argparse.Namespace):
+        set_seed(args.seed)
+        # Load data
+        self.eval_set = json.load(open(args.dataset_path, 'r', encoding='utf-8'))
+        self.demo_set = json.load(open(args.demonstration_set_path, 'r', encoding='utf-8'))
+        # Filter schema
+        sic = SchemaItemClassifierInference(args.sic_path)
+        self.demo_set = filter_schema(self.demo_set, 'train', None, args.table_num, args.column_num)
+        self.eval_set = filter_schema(self.eval_set, 'eval', sic, args.table_num, args.column_num)
+        del sic; torch.cuda.empty_cache()
+        # Add sequences
+        for item in self.demo_set:
+            item['schema_sequence'] = get_db_schema_sequence(item['schema'])
+            item['content_sequence'] = get_matched_content_sequence(item['matched_contents'])
+        for item in self.eval_set:
+            item['schema_sequence'] = get_db_schema_sequence(item['schema'])
+            item['content_sequence'] = get_matched_content_sequence(item['matched_contents'])
+        # Similarity and selection
+        sim_model = SimCSE('princeton-nlp/sup-simcse-roberta-base')
+        sel = DemonstrationSelector(sim_model, args.num_of_demonstrations)
+        qs = [i['question'] for i in self.eval_set]
+        dqs = [i['question'] for i in self.demo_set]
+        self.topk = sel.select(qs, dqs)
+        del sim_model
+        self.generator = Text2SQLGenerator(args.llm_path, args.max_new_tokens)
+        self.args = args
 
-if __name__ == "__main__":
-    set_seed(42)
-    opt = parse_option()
-    print(opt)
+    def run(self) -> None:
+        preds = []
+        for idx, ex in enumerate(tqdm(self.eval_set, desc='Eval examples')):
+            # Build prompt
+            seqs = self.topk[idx]
+            prompt = ''
+            for j in seqs:
+                demo = self.demo_set[j]
+                prompt += f"{demo['schema_sequence']}\n{demo['content_sequence']}\n{demo['question']} ;\n{demo['sql'].rstrip(';')} ;\n\n"
+            prompt += f"{ex['schema_sequence']}\n{ex['content_sequence']}\n{ex['question']}\n"
+            # Generate and post-process
+            cands = self.generator.generate(prompt, self.args.max_tokens - self.args.max_new_tokens)
+            sqls = [SQLPostProcessor.clean(s, ex['schema']['schema_items']) for s in cands]
+            # Pick first executable
+            final = next((s for s in sqls if check_sql_executability(s, ex['db_path']) is None), sqls[0] or 'SQL placeholder')
+            preds.append(final)
+        # Save and evaluate
+        out_file = 'pred_sqls.txt'
+        with open(out_file, 'w', encoding='utf-8') as f:
+            for s in preds: f.write(s + '\n')
+        # Dataset-specific hook
+        if 'spider' in self.args.dataset_path:
+            os.system(
+                f"python -u test_suite_sql_eval/evaluation.py --gold data/.../dev_gold.sql "
+                f"--pred {out_file} --db data/.../database --etype exec"
+            )
 
-    # load the evaluation set
-    eval_set = json.load(open(opt.dataset_path))
-    eval_set_questions = [data["question"] for data in eval_set]
-    eval_set_question_skeletons = [extract_skeleton(question) for question in eval_set_questions]
 
-    print("length of evaluation set:", len(eval_set))
+def main() -> None:
+    args = parse_args()
+    pipeline = EvaluationPipeline(args)
+    pipeline.run()
 
-    # load the demonstration pool
-    demonstration_set = json.load(open(opt.demonstration_set_path))
-    demonstration_set_questions = [data["question"] for data in demonstration_set]
-    demonstration_set_question_skeletons = [extract_skeleton(question) for question in demonstration_set_questions]
-    
-    print("length of demonstration set:", len(demonstration_set))
-    
-    demonstration_set = filter_schema(demonstration_set, "train", None, opt.table_num, opt.column_num)
-    sic = SchemaItemClassifierInference(opt.sic_path)
-    eval_set = filter_schema(eval_set, "eval", sic, opt.table_num, opt.column_num)
-    del sic
-    torch.cuda.empty_cache()
 
-    # prepare schema sequence and content sequence for each sample
-    for demonstration_sample in demonstration_set:
-        demonstration_sample["schema_sequence"] = get_db_schema_sequence(demonstration_sample["schema"])
-        demonstration_sample["content_sequence"] = get_matched_content_sequence(demonstration_sample["matched_contents"])
-    for eval_sample in eval_set:
-        eval_sample["schema_sequence"] = get_db_schema_sequence(eval_sample["schema"])
-        eval_sample["content_sequence"] = get_matched_content_sequence(eval_sample["matched_contents"])
-
-    # compute similarities between questions in the evaluation set and the demonstration pool
-    simsce_model = SimCSE("princeton-nlp/sup-simcse-roberta-base")
-    question_similarities = simsce_model.similarity(eval_set_questions, demonstration_set_questions)
-    question_skeleton_similarities = simsce_model.similarity(eval_set_question_skeletons, demonstration_set_question_skeletons)
-    similarities = np.maximum(question_similarities, question_skeleton_similarities)
-    
-    del simsce_model
-
-    tokenizer = AutoTokenizer.from_pretrained(opt.llm_path)
-    model = AutoModelForCausalLM.from_pretrained(opt.llm_path, device_map = "auto", torch_dtype = torch.float16)
-    model.eval()
-    print(model.dtype)
-
-    # update eos token id of the tokenizer and the model to support early stop SQL generation
-    token_ids_of_example_sql = tokenizer("SELECT * FROM tables ;")["input_ids"]
-    print(token_ids_of_example_sql)
-    if token_ids_of_example_sql[-1] == tokenizer.eos_token_id:
-        new_eos_token_id = token_ids_of_example_sql[-2]
-    else:
-        new_eos_token_id = token_ids_of_example_sql[-1]
-    model.config.eos_token_id = new_eos_token_id
-    tokenizer.eos_token_id = new_eos_token_id
-    print("new_eos_token_id:", new_eos_token_id)
-    print("tokenizer.decode(new_eos_token_id): '{}'".format(tokenizer.decode(new_eos_token_id)))
-
-    max_tokens = opt.max_tokens
-    max_new_tokens = opt.max_new_tokens
-
-    print("max_tokens:", max_tokens)
-    print("max_new_tokens:", max_new_tokens)
-
-    predicted_sqls = []
-    for eval_data_idx, eval_data in tqdm(enumerate(eval_set)):
-        input_seq = prepare_cross_domain_input_seq(opt, eval_data, demonstration_set, similarities[eval_data_idx])
-    
-        if eval_data_idx < 2:
-            print(input_seq)
-        
-        generated_sqls = text2sql_func(model, input_seq, tokenizer, max_tokens, max_new_tokens, new_eos_token_id)
-        generated_sqls = [post_process(generated_sql, eval_data["schema"]["schema_items"]) for generated_sql in generated_sqls]
-        
-        final_generated_sql = None
-        for generated_sql in generated_sqls:
-            execution_error = check_sql_executability(generated_sql, eval_data["db_path"])
-            if execution_error is None: # the generated sql has no execution errors, we will return it as the final generated sql
-                final_generated_sql = generated_sql
-                break
-
-        if final_generated_sql is None:
-            if generated_sqls[0].strip() != "":
-                final_generated_sql = generated_sqls[0]
-            else:
-                final_generated_sql = "SQL placeholder"
-        
-        print(final_generated_sql)
-        predicted_sqls.append(final_generated_sql)
-
-    print("LLM name:", opt.llm_path)
-    if "bird" in opt.dataset_path:
-        bird_results_dict = dict()
-        for idx, (data, predicted_sql) in enumerate(zip(eval_set, predicted_sqls)):
-            bird_results_dict[idx] = predicted_sql + "\t----- bird -----\t" + data["db_id"]
-        with open("predict_dev.json", "w", encoding = 'utf-8') as f:
-            f.write(json.dumps(bird_results_dict, indent = 2, ensure_ascii = False))
-        os.system("sh bird_evaluation/run_evaluation.sh {}".format("predict_dev.json"))
-    elif "spider_dev" in opt.dataset_path:
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Execution accuracy:")
-        os.system('python -u test_suite_sql_eval/evaluation.py --gold ./data/sft_data_collections/spider/dev_gold.sql --pred pred_sqls.txt --db ./data/sft_data_collections/spider/database --etype exec')
-        print("Test suit execution accuracy:")
-        os.system('python -u test_suite_sql_eval/evaluation.py --gold ./data/sft_data_collections/spider/dev_gold.sql --pred pred_sqls.txt --db test_suite_sql_eval/test_suite_database --etype exec')
-    elif "bank" in opt.dataset_path:
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Execution accuracy:")
-        os.system('python -u evaluate_ex.py --pred pred_sqls.txt --gold {} --db ./data/sft_data_collections/domain_datasets/databases/Bank_Financials/Bank_Financials.sqlite'.format(opt.dataset_path))
-    elif "aminer" in opt.dataset_path:
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Execution accuracy:")
-        os.system('python -u evaluate_ex.py --pred pred_sqls.txt --gold {} --db ./data/sft_data_collections/domain_datasets/databases/Aminer_Simplified/Aminer_Simplified.sqlite'.format(opt.dataset_path))
+if __name__ == '__main__':
+    main()

@@ -1,7 +1,6 @@
 db_root_path='./data/sft_data_collections/bird/dev/dev_databases/'
 data_mode='dev'
 diff_json_path='./data/sft_data_collections/bird/dev/dev.json'
-# predicted_sql_path=$1
 ground_truth_path='./data/sft_data_collections/bird/dev/'
 num_cpus=16
 meta_time_out=30.0

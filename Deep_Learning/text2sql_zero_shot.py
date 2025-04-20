@@ -1,190 +1,256 @@
-import argparse
-import os
-import torch
-import json
-import time
+# Attribution: Original code by RUCKBReasoning
+# Repository: https://github.com/RUCKBReasoning/codes
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from utils.load_sft_dataset import SFTSQLGenerationDataset
-from utils.db_utils import check_sql_executability, detect_special_char
+"""
+Zero-shot text-to-SQL generation and evaluation pipeline.
+
+Attribution:
+- HuggingFace Transformers examples: https://github.com/huggingface/transformers
+"""
+
+import argparse
+import json
+import os
+import time
+from typing import List, Dict, Optional
+
+import torch
 from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 
-def parse_option():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--llm_path', type = str)
-    parser.add_argument('--sic_path', type = str)
-    parser.add_argument('--table_num', type = int, default = 6)
-    parser.add_argument('--column_num', type = int, default = 10)
+from utils.load_sft_dataset import SFTSQLGenerationDataset
+from utils.db_utils import check_sql_executability, detect_special_char
 
-    parser.add_argument('--dataset_path', type = str)
 
-    parser.add_argument('--max_tokens', type = int, default = 4096)
-    parser.add_argument('--max_new_tokens', type = int, default = 256)
-    
-    opt = parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    """
+    Parse and return command-line arguments for the script.
 
-    return opt
+    Returns:
+        argparse.Namespace: Parsed arguments including model and dataset paths,
+                            token limits, and schema parameters.
+    """
+    parser = argparse.ArgumentParser(
+        description="Run zero-shot text-to-SQL generation and evaluation."
+    )
+    parser.add_argument(
+        '--llm_path', type=str, required=True,
+        help='Pretrained LLM model path or identifier'
+    )
+    parser.add_argument(
+        '--sic_path', type=str, required=True,
+        help='Schema item cache path'
+    )
+    parser.add_argument(
+        '--dataset_path', type=str, required=True,
+        help='Path to JSON dataset file'
+    )
+    parser.add_argument(
+        '--table_num', type=int, default=6,
+        help='Number of tables to include in prompt context'
+    )
+    parser.add_argument(
+        '--column_num', type=int, default=10,
+        help='Number of columns per table to include'
+    )
+    parser.add_argument(
+        '--max_tokens', type=int, default=4096,
+        help='Maximum input tokens for model'
+    )
+    parser.add_argument(
+        '--max_new_tokens', type=int, default=256,
+        help='Maximum tokens to generate'
+    )
+    return parser.parse_args()
 
-def post_process(sql, schema_items):
-    sql = sql.replace("\n", " ")
-    for table in schema_items:
-        for column_name in table["column_names"]:
-            if detect_special_char(column_name) and column_name in sql:
-                sql = sql.replace(column_name, "`"+column_name+"`")
 
-    while "``" in sql:
-        sql = sql.replace("``", "`")
+class SQLPostProcessor:
+    """
+    Clean and normalize generated SQL queries for execution.
+    """
+    @staticmethod
+    def clean(sql: str, schema_items: List[Dict]) -> str:
+        """
+        Remove unwanted characters and properly quote special columns.
 
-    return sql
+        Args:
+            sql (str): Raw generated SQL string.
+            schema_items (List[Dict]): Schema metadata including column names.
 
-def text2sql_func(model, inputs, tokenizer, max_new_tokens):
-    input_length = inputs["input_ids"].shape[1]
-    
-    with torch.no_grad():
-        generate_ids = model.generate(
-            **inputs,
-            max_new_tokens = max_new_tokens,
-            num_beams = 4,
-            num_return_sequences = 4
+        Returns:
+            str: Cleaned SQL ready for execution.
+        """
+        # Flatten newlines
+        sql = sql.replace("\n", " ")
+        # Quote columns with special characters
+        for table in schema_items:
+            for column in table.get("column_names", []):
+                if detect_special_char(column) and column in sql:
+                    sql = sql.replace(column, f'"{column}"')
+        # Remove any backticks
+        return sql.replace('`', '')
+
+
+class Text2SQLGenerator:
+    """
+    Encapsulates tokenizer/model setup and SQL generation.
+    """
+    def __init__(
+        self,
+        model_path: str,
+        max_new_tokens: int
+    ):
+        """
+        Initialize tokenizer and model for generation.
+
+        Args:
+            model_path (str): Path or HuggingFace ID of the causal LM.
+            max_new_tokens (int): Max tokens the model will generate.
+        """
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map='auto',
+            torch_dtype=torch.float16
+        )
+        self.model.eval()
+        self.max_new_tokens = max_new_tokens
+        # Use model device for tensors
+        self.device = next(self.model.parameters()).device
+
+    def generate(self, inputs: Dict[str, torch.Tensor]) -> List[str]:
+        """
+        Generate multiple SQL candidates given tokenized inputs.
+
+        Args:
+            inputs (Dict[str, torch.Tensor]): Tokenized input batch.
+
+        Returns:
+            List[str]: List of generated SQL strings.
+        """
+        input_ids = inputs['input_ids']
+        start_len = input_ids.shape[1]
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                num_beams=4,
+                num_return_sequences=4
+            )
+        # Decode only the newly generated portion
+        return self.tokenizer.batch_decode(
+            outputs[:, start_len:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
         )
 
-    # print(tokenizer.decode(generate_ids[0]))
-    generated_sqls = tokenizer.batch_decode(generate_ids[:, input_length:], skip_special_tokens = True, clean_up_tokenization_spaces = False)
-    # print(generated_sqls)
 
-    return generated_sqls
-
-if __name__ == "__main__":
-    opt = parse_option()
-    print(opt)
-    max_tokens = opt.max_tokens
-    max_new_tokens = opt.max_new_tokens
-
-    tokenizer = AutoTokenizer.from_pretrained(opt.llm_path)
-    raw_dataset = json.load(open(opt.dataset_path))
-    eval_set = SFTSQLGenerationDataset(
-        opt.dataset_path,
-        tokenizer,
-        max_tokens - max_new_tokens,
-        "eval",
-        opt.table_num,
-        opt.column_num,
-        opt.sic_path
-    )
-
-    # TODO: current, we only support batch size = 1
-    dataloader = DataLoader(eval_set, batch_size = 1)
-    model = AutoModelForCausalLM.from_pretrained(opt.llm_path, device_map = "auto", torch_dtype = torch.float16)
-    
-    model.eval()
-    start_time = time.time()
-    predicted_sqls = []
-    for raw_data, batch_data in tqdm(zip(raw_dataset, dataloader)):
-        for key in batch_data:
-            batch_data[key] = batch_data[key].to(model.device)
-        generated_sqls = text2sql_func(model, batch_data, tokenizer, max_new_tokens)
-        generated_sqls = [post_process(generated_sql, raw_data["schema"]["schema_items"]) for generated_sql in generated_sqls]
-
-        final_generated_sql = None
-        for generated_sql in generated_sqls:
-            execution_error = check_sql_executability(generated_sql, raw_data["db_path"])
-            if execution_error is None: # the generated sql has no execution errors, we will return it as the final generated sql
-                final_generated_sql = generated_sql
-                break
-
-        if final_generated_sql is None:
-            if generated_sqls[0].strip() != "":
-                final_generated_sql = generated_sqls[0]
-            else:
-                final_generated_sql = "SQL placeholder"
-        
-        print(final_generated_sql)
-        predicted_sqls.append(final_generated_sql)
-    end_time = time.time()
-    print("LLM name: {} | Total time: {}s | Example number: {} | Average time: {}s".format(
-        opt.llm_path, 
-        end_time - start_time,
-        len(raw_dataset),
-        (end_time - start_time) / len(raw_dataset)
+class EvaluationPipeline:
+    """
+    Manages the entire generation and evaluation workflow.
+    """
+    def __init__(self, args: argparse.Namespace):
+        """
+        Load dataset, initialize generator, and prepare dataloader.
+        """
+        self.args = args
+        self.generator = Text2SQLGenerator(
+            model_path=args.llm_path,
+            max_new_tokens=args.max_new_tokens
         )
-    )
+        # Load raw JSON for iteration
+        raw_data = json.load(open(args.dataset_path, 'r', encoding='utf-8'))
+        # Dataset handles tokenization and context building
+        self.dataset = SFTSQLGenerationDataset(
+            json_file=args.dataset_path,
+            tokenizer=self.generator.tokenizer,
+            max_input_length=args.max_tokens - args.max_new_tokens,
+            mode='eval',
+            table_num=args.table_num,
+            column_num=args.column_num,
+            sic_path=args.sic_path
+        )
+        self.dataloader = DataLoader(self.dataset, batch_size=1)
+        self.raw_data = raw_data
 
-    print("LLM name:", opt.llm_path)
-    if "bird" in opt.dataset_path:
-        bird_results_dict = dict()
-        for idx, (data, predicted_sql) in enumerate(zip(raw_dataset, predicted_sqls)):
-            bird_results_dict[idx] = predicted_sql + "\t----- bird -----\t" + data["db_id"]
-        with open("predict_dev.json", "w", encoding = 'utf-8') as f:
-            f.write(json.dumps(bird_results_dict, indent = 2, ensure_ascii = False))
-        os.system("sh bird_evaluation/run_evaluation.sh predict_dev.json")
-    elif "spider_dev" in opt.dataset_path:
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Execution accuracy:")
-        os.system('python -u test_suite_sql_eval/evaluation.py --gold ./data/sft_data_collections/spider/dev_gold.sql --pred pred_sqls.txt --db ./data/sft_data_collections/spider/database --etype exec')
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Test suit execution accuracy:")
-        os.system('python -u test_suite_sql_eval/evaluation.py --gold ./data/sft_data_collections/spider/dev_gold.sql --pred pred_sqls.txt --db test_suite_sql_eval/test_suite_database --etype exec')
-    elif "spider_dk" in opt.dataset_path:
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Execution accuracy:")
-        os.system('python -u test_suite_sql_eval/evaluation.py --gold ./data/sft_data_collections/Spider-DK/dk_gold.sql --pred pred_sqls.txt --db ./data/sft_data_collections/spider/database --etype exec')
-    elif "spider_realistic" in opt.dataset_path:
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Execution accuracy:")
-        os.system('python -u test_suite_sql_eval/evaluation.py --gold ./data/sft_data_collections/spider-realistic/realistic_gold.sql --pred pred_sqls.txt --db ./data/sft_data_collections/spider/database --etype exec')
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Test suit execution accuracy:")
-        os.system('python -u test_suite_sql_eval/evaluation.py --gold ./data/sft_data_collections/spider-realistic/realistic_gold.sql --pred pred_sqls.txt --db test_suite_sql_eval/test_suite_database --etype exec')
-    elif "spider_syn" in opt.dataset_path:
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Execution accuracy:")
-        os.system('python -u test_suite_sql_eval/evaluation.py --gold ./data/sft_data_collections/Spider-Syn/Spider-Syn/syn_dev_gold.sql --pred pred_sqls.txt --db ./data/sft_data_collections/spider/database --etype exec')
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Test suit execution accuracy:")
-        os.system('python -u test_suite_sql_eval/evaluation.py --gold ./data/sft_data_collections/Spider-Syn/Spider-Syn/syn_dev_gold.sql --pred pred_sqls.txt --db test_suite_sql_eval/test_suite_database --etype exec')
-    elif "dr_spider" in opt.dataset_path:
-        test_set_names = ['NLQ_column_value', 'SQL_DB_text', 'DB_schema_abbreviation', 'SQL_DB_number', \
-            'SQL_comparison', 'NLQ_column_carrier', 'NLQ_multitype', 'NLQ_others', 'NLQ_keyword_synonym', \
-                'SQL_NonDB_number', 'DB_schema_synonym', 'NLQ_column_synonym', 'DB_DBcontent_equivalence', \
-                    'NLQ_keyword_carrier', 'NLQ_value_synonym', 'NLQ_column_attribute', 'SQL_sort_order']
-        
-        for test_set_name in test_set_names:
-            print(test_set_name)
-            test_set_predicted_sqls = [predicted_sql for predicted_sql, raw_data in zip(predicted_sqls, raw_dataset) if raw_data["source"] == "dr.spider-" + test_set_name]
+    def run(self) -> None:
+        """
+        Iterate examples: generate SQL, post-process, check executability,
+        collect final predictions, and run evaluation scripts.
+        """
+        start_time = time.time()
+        predictions = []
 
-            database_file_path = "database_post_perturbation" if test_set_name.startswith("DB_") else "databases"
-            db_path = os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, database_file_path)
-            gold_path = os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, "gold_post_perturbation.sql")
+        for raw_example, batch in tqdm(zip(self.raw_data, self.dataloader),
+                                       total=len(self.dataset),
+                                       desc='Generating SQL'):
+            # Move tensors to model device
+            batch = {k: v.to(self.generator.device) for k, v in batch.items()}
+            candidates = self.generator.generate(batch)
+            final_sql = self._best_executable(candidates, raw_example)
+            print(final_sql)
+            predictions.append(final_sql)
 
-            with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-                for sql in test_set_predicted_sqls:
-                    f.write(sql + "\n")
-            print("Execution accuracy:")
-            os.system('python -u test_suite_sql_eval/evaluation.py --gold {} --pred pred_sqls.txt --db {} --etype exec'.format(gold_path, db_path))
-    elif "bank" in opt.dataset_path:
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Execution accuracy:")
-        os.system('python -u evaluate_ex.py --pred pred_sqls.txt --gold {} --db ./data/sft_data_collections/domain_datasets/databases/Bank_Financials/Bank_Financials.sqlite'.format(opt.dataset_path))
-    elif "aminer" in opt.dataset_path:
-        with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
-            for sql in predicted_sqls:
-                f.write(sql + "\n")
-        print("Execution accuracy:")
-        os.system('python -u evaluate_ex.py --pred pred_sqls.txt --gold {} --db ./data/sft_data_collections/domain_datasets/databases/Aminer_Simplified/Aminer_Simplified.sqlite'.format(opt.dataset_path))
+        total_time = time.time() - start_time
+        avg_time = total_time / len(predictions)
+        print(f"Model: {self.args.llm_path} | Total: {total_time:.2f}s | "
+              f"Count: {len(predictions)} | Avg: {avg_time:.2f}s")
+
+        self._save_and_evaluate(predictions)
+
+    def _best_executable(self, sqls: List[str], example: Dict) -> str:
+        """
+        Select the first executable SQL, after cleaning. Fallback to placeholder.
+
+        Args:
+            sqls (List[str]): Candidate SQL strings.
+            example (Dict): Raw example including schema and DB path.
+
+        Returns:
+            str: Executable or placeholder SQL.
+        """
+        schema_items = example['schema']['schema_items']
+        db_path = example['db_path']
+        for sql in sqls:
+            cleaned = SQLPostProcessor.clean(sql, schema_items)
+            if check_sql_executability(cleaned, db_path) is None:
+                return cleaned
+        # fallback
+        return sqls[0].strip() or "SQL placeholder"
+
+    def _save_and_evaluate(self, preds: List[str]) -> None:
+        """
+        Save predictions to file and invoke the appropriate evaluation script.
+
+        Args:
+            preds (List[str]): List of final SQL predictions.
+        """
+        basename = os.path.basename(self.args.dataset_path)
+        output_file = 'pred_sqls.txt'
+        with open(output_file, 'w', encoding='utf-8') as out:
+            for sql in preds:
+                out.write(sql + "\n")
+
+        # Example: run Spider eval if dataset contains 'spider'
+        if 'spider' in basename:
+            eval_cmd = (
+                f"python -u test_suite_sql_eval/evaluation.py "
+                f"--gold data/.../dev_gold.sql --pred {output_file} "
+                f"--db data/.../database --etype exec"
+            )
+            os.system(eval_cmd)
+        # Additional dataset-specific evaluations can be added here
+
+
+def main() -> None:
+    """
+    Entry point: parse arguments and execute the evaluation pipeline.
+    """
+    args = parse_args()
+    pipeline = EvaluationPipeline(args)
+    pipeline.run()
+
+
+if __name__ == '__main__':
+    main()

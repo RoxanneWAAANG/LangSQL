@@ -1,13 +1,13 @@
+'''
+copy from the source code of pl_bolts
+'''
+
 import math
 import warnings
 from typing import List
 
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.optim import Optimizer
-
-'''
-copy from the source code of pl_bolts
-'''
 
 class LinearWarmupCosineAnnealingLR(_LRScheduler):
     """Sets the learning rate of each parameter group to follow a linear warmup schedule between warmup_start_lr

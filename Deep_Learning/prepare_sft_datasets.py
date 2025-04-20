@@ -1,505 +1,223 @@
+# Attribution: Original code by RUCKBReasoning
+# Repository: https://github.com/RUCKBReasoning/codes
+
+"""
+Prepare Seq2SQL fine-tuning dataset in Spider style, with optional evidence.
+
+Attribution:
+- sqlparse: https://github.com/andialbrecht/sqlparse
+- pyserini LuceneSearcher: https://github.com/castorini/pyserini
+- sql_metadata Parser: https://github.com/macbre/sql-metadata
+- NLTK utilities
+"""
 import json
 import os
 import re
 import random
-import sqlparse
+from typing import List, Dict, Any
 
-from nltk.tokenize import word_tokenize
-from nltk import ngrams
+import sqlparse
+from nltk import ngrams, word_tokenize
 from sql_metadata import Parser
 from pyserini.search.lucene import LuceneSearcher
+
 from utils.bridge_content_encoder import get_matched_entries
 from utils.db_utils import get_db_schema
 
 random.seed(42)
 
-def extract_large_numbers(text):
-    number_information = []
-    patterns = {
-        'thousand': 10**3,
-        'million': 10**6,
-        'billion': 10**9,
-        'trillion': 10**12
-    }
-    
-    for word, multiplier in patterns.items():
-        matches = re.findall(r'(\d+\.?\d*)\s*{}'.format(word), text, flags=re.IGNORECASE)
-        for match in matches:
-            number = float(match) * multiplier
-            number_information.append(match + " " + word + " = " + str(int(number)))
-    
-    for phrase, number in {'thousands of': 10**3, 'millions of': 10**6, 'billions of': 10**9, 'trillions of': 10**12}.items():
-        if phrase in text:
-            number_information.append(phrase + " = " + str(int(number)))
-    
-    large_number_evidence = ""
-    for info in number_information:
-        large_number_evidence += info + "; "
-    
-    return large_number_evidence.strip()
 
-def remove_table_alias(s):
+def extract_large_numbers(text: str) -> str:
+    """
+    Convert word-based large numbers (e.g., '3 million') into numeric form.
+    Returns semicolon-separated evidence entries.
+    """
+    mappings = {'thousand': 10**3, 'million': 10**6, 'billion': 10**9, 'trillion': 10**12}
+    infos = []
+    for key, mult in mappings.items():
+        for match in re.findall(r"(\d+\.?\d*)\s*%s" % key, text, flags=re.IGNORECASE):
+            val = int(float(match) * mult)
+            infos.append(f"{match} {key} = {val}")
+    for phrase, mult in {'thousands of':10**3,'millions of':10**6}.items():
+        if phrase in text.lower():
+            infos.append(f"{phrase} = {mult}")
+    return "; ".join(infos)
+
+
+def sanitize_sql_alias(sql: str) -> str:
+    """
+    Remove table aliases and restore original table names in SQL.
+    """
     try:
-        tables_aliases = Parser(s).tables_aliases
-    except Exception as e:
-        return s
+        aliases = Parser(sql).tables_aliases
+    except Exception:
+        return sql
+    for alias, tbl in aliases.items():
+        sql = re.sub(rf"\bAS\s+{alias}\b", '', sql, flags=re.IGNORECASE)
+        sql = re.sub(rf"\b{alias}\b", tbl, sql)
+    return sql
 
-    new_tables_aliases = {}
-    for i in range(1,11):
-        if "t{}".format(i) in tables_aliases.keys():
-            new_tables_aliases["t{}".format(i)] = tables_aliases["t{}".format(i)]
-    
-    tables_aliases = new_tables_aliases
-    for k, v in tables_aliases.items():
-        # remove AS clauses
-        s = s.replace("AS " + k + " ", "")
-        # replace table alias with thier original names
-        s = s.replace(k, v)
-    
-    return s
 
-def remove_similar_comments(names, comments):
-    '''
-    Remove table (or column) comments that have a high degree of similarity with their names
-    
-    Arguments:
-        names: a list of table (or column) names
-        comments: a list of table (or column) comments
-    
-    Returns:
-        new_comments: a list of new table (or column) comments
-    '''
-    new_comments = []
-    for name, comment in zip(names, comments):    
-        if name.replace("_", "").replace(" ", "") == comment.replace("_", "").replace(" ", ""):
-            new_comments.append("")
-        else:
-            new_comments.append(comment)
-    
-    return new_comments
-
-def str_replace_ignore_case(evidence, schema_item_name):
-    evidence = re.sub(re.escape(schema_item_name), schema_item_name, evidence, 0, re.IGNORECASE)
-
-    return evidence
-
-def obtain_n_grams(sequence, max_n):
-    '''
-    returns all grams of sequence less than or equal to `max_n`
-    '''
-    tokens = word_tokenize(sequence)
-    all_grams = []
-    for n in range(1, max_n + 1):
-        all_grams.extend([" ".join(gram) for gram in ngrams(tokens, n)])
-    
-    return all_grams
-
-def preprocess_evidence(evidence, schema_items):
-    if evidence.strip() == "":
-        return ""
-
-    evidence = evidence.strip()
-    # if evidence does not end with ";", add a ";" char
-    if not evidence.endswith(";"):
-        evidence += ";"
-    
-    # lowercase schema items appeared in the evidence
-    for table in schema_items:
-        if table["table_name"] in evidence.lower():
-            evidence = str_replace_ignore_case(evidence, table["table_name"])
-
-        for column_name in table["column_names"]:
-            if column_name in evidence.lower():
-                evidence = str_replace_ignore_case(evidence, column_name)
-    
-    evidence = evidence.replace("< =", "<=").replace("> =", ">=")
-
-    return evidence
-
-def spider_style_dataset(
-    dataset_path, 
-    db_path, 
-    db_content_index_path, 
-    source, 
-    table_json_path,
-    use_evidence,
-    mode
-):
-    '''
-    Load spider-style dataset
-    
-    Arguments:
-        dataset_path: directory to load the dataset from
-        db_path: directory of databases (used for extracting schema, including tables, columns, column contents, and foreign keys)
-        db_content_index_path: directory of database content sparse index
-        source: source of examples
-        table_json_path: directory to load additional database information (used for extracting comments for tables and columns)
-        use_evidence: whether to use the additional evidence in the input sequence
-    Returns:
-        returned_dataset: prepared dataset
-    '''
-    returned_dataset = []
-
-    dataset = json.load(open(dataset_path))
-    additional_db_info = json.load(open(table_json_path))
-
-    db_comments = dict()
-    # record comments for tables and columns
-    for db_info in additional_db_info:
-        comment_dict = dict()
-
-        column_names = [column_name.lower() for _, column_name in db_info["column_names_original"]]
-        table_idx_of_each_column = [t_idx for t_idx, _ in db_info["column_names_original"]]
-        column_comments = [column_comment.lower() for _, column_comment in db_info["column_names"]]
-        
-        assert len(column_names) == len(column_comments)
-        column_comments = remove_similar_comments(column_names, column_comments)
-
-        table_names = [table_name.lower() for table_name in db_info["table_names_original"]]
-        table_comments = [table_comment.lower() for table_comment in db_info["table_names"]]
-        
-        assert len(table_names) == len(table_comments)
-        table_comments = remove_similar_comments(table_names, table_comments)
-
-        # enumerate each table and its columns
-        for table_idx, (table_name, table_comment) in enumerate(zip(table_names, table_comments)):
-            comment_dict[table_name] = {
-                "table_comment": table_comment,
-                "column_comments": dict()
-            }
-            for t_idx, column_name, column_comment in zip(table_idx_of_each_column, column_names, column_comments):
-                # record columns in current table
-                if t_idx == table_idx:
-                    comment_dict[table_name]["column_comments"][column_name] = column_comment
-
-        db_comments[db_info["db_id"]] = comment_dict
-
-    db_ids = set([data["db_id"] for data in dataset])
-    db_id2searcher = dict()
-    for db_id in db_ids:
-        db_id2searcher[db_id] = LuceneSearcher(os.path.join(db_content_index_path, db_id))
-
-    db_id2schema = dict()
-
-    for data in dataset:
-        sample = {}
-        db_id = data["db_id"]
-        
-        sample["db_id"] = db_id
-        sample["db_path"] = os.path.join(db_path, db_id, db_id + ".sqlite")
-
-        if db_id in db_id2schema:
-            sample["schema"] = db_id2schema[db_id]
-        else:
-            db_id2schema[db_id] = get_db_schema(sample["db_path"], db_comments, db_id)
-            sample["schema"] = db_id2schema[db_id]
-
-        if "spider-syn" in source:
-            sample["question"] = data["SpiderSynQuestion"]
-            sample["evidence"] = ""
-        elif "bird" in source:
-            sample["question"] = data["question"]
-            evidence = preprocess_evidence(data["evidence"], sample["schema"]["schema_items"])
-            sample["evidence"] = evidence
-        elif "bank" in source:
-            sample["question"] = data["question"]
-            sample["evidence"] = extract_large_numbers(data["question"])
-        else:
-            sample["question"] = data["question"]
-            sample["evidence"] = ""
-        
-        if "\n" in sample["question"]:
-            sample["question"] = sample["question"].replace("\n", " ")
-        if "\n" in sample["evidence"]:
-            sample["evidence"] = sample["evidence"].replace("\n", " ")
-        
-        sample["text"] = sample["evidence"] + " " + sample["question"] \
-            if use_evidence and sample["evidence"] != "" else sample["question"]
-
-        if mode in ["train", "dev"]:
-            sql = data["SQL"] if source in ["bird-dev", "bird-train"] else data["query"]
-            sample["sql"] = remove_table_alias(sqlparse.format(sql, keyword_case = "upper", identifier_case = "lower"))
-        elif mode == "test":
-            sample["sql"] = ""
-        
-        sample["table_labels"], sample["column_labels"] = [], []
-        try:
-            sql_tokens = [token.value for token in Parser(sample["sql"].lower()).tokens]
-        except Exception as e:
-            sql_tokens = sample["sql"].lower().split()
-        
-        for table_info in sample["schema"]["schema_items"]:
-            if mode in ["train", "dev"]:
-                table_name = table_info["table_name"]
-                sample["table_labels"].append(1 if table_name in sql_tokens else 0)
-                sample["column_labels"].append([1 if column_name in sql_tokens or table_name+"."+column_name in sql_tokens else 0 \
-                    for column_name in table_info["column_names"]])
-            elif mode == "test":
-                sample["table_labels"].append(0)
-                sample["column_labels"].append([0 for _ in range(len(table_info["column_names"]))])
-
-        # coarse-grained matching between the input text and all contents in database
-        grams = obtain_n_grams(sample["text"], 4)
-        hits = []
-        searcher = db_id2searcher[db_id]
-        for query in grams:
-            hits.extend(searcher.search(query, k = 10))
-        
-        # hits = searcher.search(sample["text"], k = 50)
-
-        coarse_matched_contents = dict()
-        for i in range(len(hits)):
-            matched_result = json.loads(hits[i].raw)
-            # `tc_name` refers to column names like `table_name.column_name`, e.g., document_drafts.document_id
-            tc_name = ".".join(matched_result["id"].split("-**-")[:2])
-            if tc_name in coarse_matched_contents.keys():
-                if matched_result["contents"] not in coarse_matched_contents[tc_name]:
-                    coarse_matched_contents[tc_name].append(matched_result["contents"])
+class EvidencePreprocessor:
+    """
+    Clean and normalize textual evidence relative to schema items.
+    """
+    @staticmethod
+    def remove_similar(names: List[str], comments: List[str]) -> List[str]:
+        """Remove comments identical to names (ignoring spaces/underscores)."""
+        out, clean = [], None
+        for nm, cm in zip(names, comments):
+            if nm.replace('_','').replace(' ','') == cm.replace('_','').replace(' ', ''):
+                out.append('')
             else:
-                coarse_matched_contents[tc_name] = [matched_result["contents"]]
-        
-        fine_matched_contents = dict()
-        for tc_name, contents in coarse_matched_contents.items():
-            # fine-grained matching between the question and coarse matched contents
-            fm_contents = get_matched_entries(sample["text"], contents)
-            
-            if fm_contents is None:
-                continue
-            for _match_str, (field_value, _s_match_str, match_score, s_match_score, _match_size,) in fm_contents:
-                if match_score < 0.9:
-                    continue
-                if tc_name in fine_matched_contents.keys():
-                    if len(fine_matched_contents[tc_name]) < 25:
-                        fine_matched_contents[tc_name].append(field_value.strip())
-                else:
-                    fine_matched_contents[tc_name] = [field_value.strip()]
+                out.append(cm)
+        return out
 
-        sample["matched_contents"] = fine_matched_contents
-        sample["source"] = source
+    @staticmethod
+    def preprocess(evidence: str, schema: List[Dict[str,Any]]) -> str:
+        """
+        Ensure evidence ends with semicolon, normalize case for schema mentions.
+        """
+        ev = evidence.strip()
+        if not ev: return ''
+        if not ev.endswith(';'): ev += ';'
+        for tbl in schema:
+            nm = tbl['table_name']
+            ev = re.sub(re.escape(nm), nm, ev, flags=re.IGNORECASE)
+            for col in tbl['column_names']:
+                ev = re.sub(re.escape(col), col, ev, flags=re.IGNORECASE)
+        return ev.replace('< =', '<=').replace('> =','>=')
 
-        returned_dataset.append(sample)
 
-    del db_id2searcher
+def get_ngrams(text: str, max_n: int=4) -> List[str]:
+    """Return all n-grams up to length max_n from text."""
+    tokens = word_tokenize(text)
+    grams = []
+    for n in range(1, max_n+1):
+        grams.extend([' '.join(gram) for gram in ngrams(tokens, n)])
+    return grams
 
-    return returned_dataset
 
-if __name__ == "__main__":
-    print("preparing training sets.....")
-    print("spider-train")
-    spider_train = []
-    # Spider training set-1 (7000 + 1658 examples)
-    for spider_train_set in ["train_spider.json", "train_others.json"]:
-        spider_train.extend(
-            spider_style_dataset(
-                dataset_path = os.path.join("./data/sft_data_collections/spider/", spider_train_set), 
-                db_path = "./data/sft_data_collections/spider/database", 
-                db_content_index_path = "./data/sft_data_collections/spider/db_contents_index",
-                source = "spider-train",
-                table_json_path = "./data/sft_data_collections/spider/tables.json",
-                use_evidence = False,
-                mode = "train"
-            )
+class SpiderStyleLoader:
+    """
+    Load and prepare a Spider-style dataset with optional evidence and content matching.
+    """
+    def __init__(
+        self,
+        dataset_path: str,
+        db_dir: str,
+        index_dir: str,
+        table_info_path: str,
+        use_evidence: bool,
+        mode: str
+    ):
+        self.data = json.load(open(dataset_path, 'r', encoding='utf-8'))
+        self.db_dir = db_dir
+        self.index_dir = index_dir
+        self.comments = self._load_table_comments(table_info_path)
+        self.use_evidence = use_evidence
+        self.mode = mode
+        self.searchers = {}
+
+    def _load_table_comments(self, path: str) -> Dict[str, Any]:
+        info = json.load(open(path, 'r', encoding='utf-8'))
+        out = {}
+        for db in info:
+            tbls = {t.lower():c.lower() for t,c in zip(
+                [n for _,n in db['table_names_original']],
+                [c for _,c in db['table_names']]
+            )}
+            cols = {}
+            names = [n.lower() for _,n in db['column_names_original']]
+            comms = [c.lower() for _,c in db['column_names']]
+            comms = EvidencePreprocessor.remove_similar(names, comms)
+            for (ti,nm), cm in zip(db['column_names_original'], comms):
+                cols.setdefault(db['table_names_original'][ti].lower(), {})[nm.lower()] = cm
+            out[db['db_id']] = {'table_comments':tbls, 'column_comments':cols}
+        return out
+
+    def _get_searcher(self, db_id: str) -> LuceneSearcher:
+        if db_id not in self.searchers:
+            idx = os.path.join(self.index_dir, db_id)
+            self.searchers[db_id] = LuceneSearcher(idx)
+        return self.searchers[db_id]
+
+    def load(self) -> List[Dict[str,Any]]:
+        result = []
+        for entry in self.data:
+            db_id = entry['db_id']
+            sample = {'db_id': db_id}
+            sample['db_path'] = os.path.join(self.db_dir, db_id, f"{db_id}.sqlite")
+            sample['schema'] = get_db_schema(sample['db_path'], self.comments, db_id)
+
+            # question and evidence
+            q = entry.get('question', entry.get('SpiderSynQuestion', ''))
+            ev = entry.get('evidence','') if 'bird' in self.mode else ''
+            if 'bank' in self.mode:
+                ev = extract_large_numbers(q)
+            ev = EvidencePreprocessor.preprocess(ev, sample['schema']['schema_items'])
+            sample['text'] = f"{ev} {q}" if self.use_evidence and ev else q.replace('\n',' ')
+
+            # SQL for train/dev
+            if self.mode in ('train','dev'):
+                raw_sql = entry.get('SQL') or entry.get('query','')
+                sample['sql'] = sanitize_sql_alias(sqlparse.format(raw_sql, keyword_case='upper', identifier_case='lower'))
+            else:
+                sample['sql'] = ''
+
+            # generate labels
+            tokens = [t.value for t in Parser(sample['sql'].lower()).tokens] if sample['sql'] else []
+            sample['table_labels'], sample['column_labels'] = [], []
+            for tbl in sample['schema']['schema_items']:
+                tnm = tbl['table_name']
+                sample['table_labels'].append(int(tnm.lower() in tokens))
+                cls = []
+                for cn in tbl['column_names']:
+                    cnm = f"{tnm.lower()}.{cn.lower()}"
+                    cls.append(int(cn.lower() in tokens or cnm in tokens))
+                sample['column_labels'].append(cls)
+
+            # content matching
+            grams = get_ngrams(sample['text'])
+            hits = []
+            searcher = self._get_searcher(db_id)
+            for g in grams:
+                hits.extend(searcher.search(g, k=10))
+            coarse = {}
+            for h in hits:
+                rec = json.loads(h.raw)
+                key = '.'.join(rec['id'].split('-**-')[:2])
+                coarse.setdefault(key, set()).add(rec['contents'])
+            fine = {}
+            for k,v in coarse.items():
+                for txt in get_matched_entries(sample['text'], list(v)) or []:
+                    if txt[2] >= 0.9:
+                        fine.setdefault(k, []).append(txt[0].strip())
+            sample['matched_contents'] = fine
+            result.append(sample)
+        return result
+
+
+def main():
+    """Prepare and save various SFT datasets."""
+    modes = [
+        ('spider-train','./data/sft_data_collections/spider/train.json', False),
+        ('bird-train', './data/.../bird/train.json', True),
+        ('bank-train','./data/.../bank.json', True)
+    ]
+    # expand as needed per dataset
+    for mode, path, use_ev in modes:
+        loader = SpiderStyleLoader(
+            dataset_path=path,
+            db_dir='./data/.../database',
+            index_dir='./data/.../db_contents_index',
+            table_info_path='./data/.../tables.json',
+            use_evidence=use_ev,
+            mode=mode.split('-')[-1]
         )
-    with open("./data/sft_spider_train_text2sql.json", "w") as f:
-        f.write(json.dumps(spider_train, indent = 2, ensure_ascii = False))
+        ds = loader.load()
+        out_path = f"./data/sft_{mode}_text2sql.json"
+        open(out_path,'w').write(json.dumps(ds, indent=2))
 
-    print("BIRD (without evidence) train")
-    # BIRD training set (9428 examples)
-    bird_train = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/bird/train/train.json", 
-        db_path = "./data/sft_data_collections/bird/train/train_databases", 
-        db_content_index_path = "./data/sft_data_collections/bird/train/db_contents_index",
-        source = "bird-train",
-        table_json_path = "./data/sft_data_collections/bird/train/train_tables.json",
-        use_evidence = False,
-        mode = "train"
-    )
-    with open("./data/sft_bird_train_text2sql.json", "w") as f:
-        f.write(json.dumps(bird_train, indent = 2, ensure_ascii = False))
-
-    print("BIRD (with evidence) train")
-    # BIRD training set with evidence (9428 examples)
-    bird_with_evidence_train = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/bird/train/train.json", 
-        db_path = "./data/sft_data_collections/bird/train/train_databases", 
-        db_content_index_path = "./data/sft_data_collections/bird/train/db_contents_index",
-        source = "bird-train",
-        table_json_path = "./data/sft_data_collections/bird/train/train_tables.json",
-        use_evidence = True,
-        mode = "train"
-    )
-    with open("./data/sft_bird_with_evidence_train_text2sql.json", "w") as f:
-        f.write(json.dumps(bird_with_evidence_train, indent = 2, ensure_ascii = False))
-    
-    print("Bank_Financials train")
-    # Bank_Financials train set
-    bank_train = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/domain_datasets/Bank_Financials_train.json", 
-        db_path = "./data/sft_data_collections/domain_datasets/databases", 
-        db_content_index_path = "./data/sft_data_collections/domain_datasets/db_contents_index",
-        source = "bank_financials-train",
-        table_json_path = "./data/sft_data_collections/domain_datasets/tables.json",
-        use_evidence = True,
-        mode = "train"
-    )
-    with open("./data/sft_bank_financials_train_text2sql.json", "w") as f:
-        f.write(json.dumps(bank_train , indent = 2, ensure_ascii = False))
-    
-    print("Aminer_Simplified train")
-    # Aminer_Simplified train set
-    aminer_train = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/domain_datasets/Aminer_Simplified_train.json", 
-        db_path = "./data/sft_data_collections/domain_datasets/databases", 
-        db_content_index_path = "./data/sft_data_collections/domain_datasets/db_contents_index",
-        source = "Aminer_Simplified-train",
-        table_json_path = "./data/sft_data_collections/domain_datasets/tables.json",
-        use_evidence = True,
-        mode = "train"
-    )
-    with open("./data/sft_aminer_simplified_train_text2sql.json", "w") as f:
-        f.write(json.dumps(aminer_train , indent = 2, ensure_ascii = False))
-    
-    print("Spider + BIRD + Bank_Financials + Aminer_Simplified train set (ALL MERGED)")
-    # merge all available training data
-    with open("./data/sft_all_merged_train_text2sql.json", "w") as f:
-        f.write(json.dumps(spider_train + bird_with_evidence_train + bank_train + aminer_train, indent = 2, ensure_ascii = False))
-    
-    print("---------------------------------------------------------------------------")
-    print("preparing dev sets.....")
-    print("spider-dk")
-    # Spider-DK development set (535 examples)
-    spider_dk = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/Spider-DK/Spider-DK.json", 
-        db_path = "./data/sft_data_collections/spider/database", 
-        db_content_index_path = "./data/sft_data_collections/spider/db_contents_index",
-        source = "spider-dk",
-        table_json_path = "./data/sft_data_collections/Spider-DK/tables.json",
-        use_evidence = False,
-        mode = "dev"
-    )
-    with open("./data/sft_spider_dk_text2sql.json", "w") as f:
-        f.write(json.dumps(spider_dk, indent = 2, ensure_ascii = False))
-    
-    print("spider-syn")
-    # Spider-Syn development set (1034 examples)
-    spider_syn = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/Spider-Syn/Spider-Syn/dev.json", 
-        db_path = "./data/sft_data_collections/spider/database", 
-        db_content_index_path = "./data/sft_data_collections/spider/db_contents_index",
-        source = "spider-syn-dev",
-        table_json_path = "./data/sft_data_collections/spider/tables.json",
-        use_evidence = False,
-        mode = "dev"
-    )
-    with open("./data/sft_spider_syn_text2sql.json", "w") as f:
-        f.write(json.dumps(spider_syn, indent = 2, ensure_ascii = False))
-    
-    print("spider-realistic")
-    # Spider-Realistic development set (507 examples)
-    spider_realistic = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/spider-realistic/spider-realistic.json", 
-        db_path = "./data/sft_data_collections/spider/database", 
-        db_content_index_path = "./data/sft_data_collections/spider/db_contents_index",
-        source = "spider-realistic",
-        table_json_path = "./data/sft_data_collections/spider/tables.json",
-        use_evidence = False,
-        mode = "dev"
-    )
-    with open("./data/sft_spider_realistic_text2sql.json", "w") as f:
-        f.write(json.dumps(spider_realistic, indent = 2, ensure_ascii = False))
-
-    print("DR.spider")
-    dr_spider = []
-    # Dr.Spider has 17 perturbation test sets
-    test_set_names = os.listdir("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data")
-    test_set_names.remove("Spider-dev")
-    for test_set_name in test_set_names:
-        if test_set_name.startswith("DB_"):
-            database_file_path = "database_post_perturbation"
-            table_file_name = "tables_post_perturbation.json"
-        else:
-            database_file_path = "databases"
-            table_file_name = "tables.json"
-        dr_spider.extend(
-                spider_style_dataset(
-                dataset_path = os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, "questions_post_perturbation.json"), 
-                db_path = os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, database_file_path), 
-                db_content_index_path = os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, "db_contents_index"),
-                source = "dr.spider-{}".format(test_set_name),
-                table_json_path = os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, table_file_name),
-                use_evidence = False,
-                mode = "dev"
-            )
-        )
-    with open("./data/sft_dr_spider_text2sql.json", "w") as f:
-        f.write(json.dumps(dr_spider, indent = 2, ensure_ascii = False))
-    
-    print("spider-dev")
-    # Spider development set (1034 examples)
-    spider_dev = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/spider/dev.json", 
-        db_path = "./data/sft_data_collections/spider/database", 
-        db_content_index_path = "./data/sft_data_collections/spider/db_contents_index",
-        source = "spider-dev",
-        table_json_path = "./data/sft_data_collections/spider/tables.json",
-        use_evidence = False,
-        mode = "dev"
-    )
-    with open("./data/sft_spider_dev_text2sql.json", "w") as f:
-        f.write(json.dumps(spider_dev, indent = 2, ensure_ascii = False))
-
-    print("BIRD-dev (without evidence)")
-    # BIRD dev set (1534 examples)
-    bird_dev = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/bird/dev/dev.json", 
-        db_path = "./data/sft_data_collections/bird/dev/dev_databases", 
-        db_content_index_path = "./data/sft_data_collections/bird/dev/db_contents_index",
-        source = "bird-dev",
-        table_json_path = "./data/sft_data_collections/bird/dev/dev_tables.json",
-        use_evidence = False,
-        mode = "dev"
-    )
-    with open("./data/sft_bird_dev_text2sql.json", "w") as f:
-        f.write(json.dumps(bird_dev, indent = 2, ensure_ascii = False))
-
-    print("BIRD-dev (with evidence)")
-    # BIRD dev set (1534 examples)
-    bird_with_evidence_dev = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/bird/dev/dev.json", 
-        db_path = "./data/sft_data_collections/bird/dev/dev_databases", 
-        db_content_index_path = "./data/sft_data_collections/bird/dev/db_contents_index",
-        source = "bird-dev",
-        table_json_path = "./data/sft_data_collections/bird/dev/dev_tables.json",
-        use_evidence = True,
-        mode = "dev"
-    )
-    with open("./data/sft_bird_with_evidence_dev_text2sql.json", "w") as f:
-        f.write(json.dumps(bird_with_evidence_dev, indent = 2, ensure_ascii = False))
-    
-    print("Bank_Financials dev set")
-    # Bank_Financials dev set (92 examples)
-    bank_dev = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/domain_datasets/Bank_Financials_dev.json", 
-        db_path = "./data/sft_data_collections/domain_datasets/databases", 
-        db_content_index_path = "./data/sft_data_collections/domain_datasets/db_contents_index",
-        source = "bank_financials-dev",
-        table_json_path = "./data/sft_data_collections/domain_datasets/tables.json",
-        use_evidence = True,
-        mode = "dev"
-    )
-    with open("./data/sft_bank_financials_dev_text2sql.json", "w") as f:
-        f.write(json.dumps(bank_dev, indent = 2, ensure_ascii = False))
-    
-    print("Aminer_Simplified dev set")
-    # Aminer_Simplified dev set (xxx examples)
-    aminer_dev = spider_style_dataset(
-        dataset_path = "./data/sft_data_collections/domain_datasets/Aminer_Simplified_dev.json", 
-        db_path = "./data/sft_data_collections/domain_datasets/databases", 
-        db_content_index_path = "./data/sft_data_collections/domain_datasets/db_contents_index",
-        source = "aminer_simplified-dev",
-        table_json_path = "./data/sft_data_collections/domain_datasets/tables.json",
-        use_evidence = True,
-        mode = "dev"
-    )
-    with open("./data/sft_aminer_simplified_dev_text2sql.json", "w") as f:
-        f.write(json.dumps(aminer_dev, indent = 2, ensure_ascii = False))
+if __name__ == '__main__':
+    main()

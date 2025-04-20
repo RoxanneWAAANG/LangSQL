@@ -1,129 +1,161 @@
-from utils.db_utils import get_cursor_from_path, execute_sql_long_time_limitation
+# Attribution: Original code by RUCKBReasoning
+# Repository: https://github.com/RUCKBReasoning/codes
+
+"""
+Builds BM25 Lucene indexes for database column contents using Pyserini.
+
+Attribution:
+- Pyserini project: https://github.com/castorini/pyserini
+- SQLite utilities from utils.db_utils
+"""
+import os
+import shutil
 import json
-import os, shutil
+import subprocess
+from typing import List, Dict
 
-def remove_contents_of_a_folder(index_path):
-    # if index_path does not exist, then create it
-    os.makedirs(index_path, exist_ok = True)
-    # remove files in index_path
-    for filename in os.listdir(index_path):
-        file_path = os.path.join(index_path, filename)
+from utils.db_utils import get_cursor_from_path, execute_sql_long_time_limitation
+
+
+def remove_directory_contents(path: str) -> None:
+    """
+    Ensure a directory exists and remove all its contents.
+
+    Args:
+        path (str): Path to the directory to clean.
+    """
+    os.makedirs(path, exist_ok=True)
+    for entry in os.listdir(path):
+        full_path = os.path.join(path, entry)
         try:
-            if os.path.isfile(file_path) or os.path.islink(file_path):
-                os.unlink(file_path)
-            elif os.path.isdir(file_path):
-                shutil.rmtree(file_path)
+            if os.path.isfile(full_path) or os.path.islink(full_path):
+                os.unlink(full_path)
+            elif os.path.isdir(full_path):
+                shutil.rmtree(full_path)
         except Exception as e:
-            print('Failed to delete %s. Reason: %s' % (file_path, e))
+            print(f"Failed to delete {full_path}: {e}")
 
-def build_content_index(db_path, index_path):
-    '''
-    Create a BM25 index for all contents in a database
-    '''
-    cursor = get_cursor_from_path(db_path)
-    results = execute_sql_long_time_limitation(cursor, "SELECT name FROM sqlite_master WHERE type='table';")
-    table_names = [result[0] for result in results]
 
-    all_column_contents = []
-    for table_name in table_names:
-        # skip SQLite system table: sqlite_sequence
-        if table_name == "sqlite_sequence":
+class ContentIndexer:
+    """
+    Handles extraction of column contents from SQLite databases
+    and creation of Lucene indexes via Pyserini.
+    """
+    def __init__(self, temp_dir: str = './data/temp_db_index'):
+        """
+        Initialize the temporary directory for intermediate JSON files.
+
+        Args:
+            temp_dir (str): Path for writing temporary JSON collections.
+        """
+        self.temp_dir = temp_dir
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+    def _extract_column_contents(self, db_path: str) -> List[Dict[str, str]]:
+        """
+        Query distinct non-null column values up to length limit.
+
+        Args:
+            db_path (str): Path to the SQLite database file.
+
+        Returns:
+            List[Dict[str,str]]: A list of documents with 'id' and 'contents'.
+        """
+        cursor = get_cursor_from_path(db_path)
+        tables = execute_sql_long_time_limitation(cursor,
+            "SELECT name FROM sqlite_master WHERE type='table';")
+        docs = []
+        for (table,) in tables:
+            if table == 'sqlite_sequence':
+                continue
+            cols = execute_sql_long_time_limitation(
+                cursor, f"PRAGMA table_info('{table}')")
+            col_names = [row[1] for row in cols]
+            for col in col_names:
+                try:
+                    query = (
+                        f"SELECT DISTINCT `{col}` FROM `{table}` WHERE `{col}` IS NOT NULL;"
+                    )
+                    rows = execute_sql_long_time_limitation(cursor, query)
+                    for idx, (val,) in enumerate(rows):
+                        text = str(val).strip()
+                        if 0 < len(text) <= 25:
+                            doc_id = f"{table}-**-{col}-**-{idx}".lower()
+                            docs.append({'id': doc_id, 'contents': text})
+                except Exception as e:
+                    print(f"Error processing {table}.{col}: {e}")
+        return docs
+
+    def build_index(self, db_path: str, index_path: str) -> None:
+        """
+        Build a Lucene index for a single database's column contents.
+
+        Args:
+            db_path (str): Path to the SQLite file.
+            index_path (str): Directory where the Lucene index will be stored.
+        """
+        # Clean existing index directory
+        remove_directory_contents(index_path)
+
+        # Extract contents and write to temporary JSON
+        docs = self._extract_column_contents(db_path)
+        temp_file = os.path.join(self.temp_dir, 'contents.json')
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(docs, f, indent=2, ensure_ascii=False)
+
+        # Construct Pyserini indexing command
+        cmd = [
+            'python', '-m', 'pyserini.index.lucene',
+            '--collection', 'JsonCollection',
+            '--input', self.temp_dir,
+            '--index', index_path,
+            '--generator', 'DefaultLuceneDocumentGenerator',
+            '--threads', '16',
+            '--storePositions',
+            '--storeDocvectors',
+            '--storeRaw'
+        ]
+        subprocess.run(cmd, check=True)
+
+        # Clean up temporary file
+        os.remove(temp_file)
+
+
+def prepare_indices(db_root: str, index_root: str) -> None:
+    """
+    Walk through databases under db_root to build indexes in parallel directory structure under index_root.
+
+    Args:
+        db_root (str): Root directory containing subdirectories per database ID.
+        index_root (str): Root directory for storing per-database indices.
+    """
+    indexer = ContentIndexer()
+    for db_id in os.listdir(db_root):
+        db_dir = os.path.join(db_root, db_id)
+        sqlite_file = os.path.join(db_dir, f"{db_id}.sqlite")
+        if not os.path.isfile(sqlite_file):
             continue
-        results = execute_sql_long_time_limitation(cursor, "SELECT name FROM PRAGMA_TABLE_INFO('{}')".format(table_name))
-        column_names_in_one_table = [result[0] for result in results]
-        for column_name in column_names_in_one_table:
-            try:
-                print("SELECT DISTINCT `{}` FROM `{}` WHERE `{}` IS NOT NULL;".format(column_name, table_name, column_name))
-                results = execute_sql_long_time_limitation(cursor, "SELECT DISTINCT `{}` FROM `{}` WHERE `{}` IS NOT NULL;".format(column_name, table_name, column_name))
-                column_contents = [str(result[0]).strip() for result in results]
+        idx_path = os.path.join(index_root, db_id)
+        print(f"Indexing {db_id}...")
+        indexer.build_index(sqlite_file, idx_path)
 
-                for c_id, column_content in enumerate(column_contents):
-                    # remove empty and extremely-long contents
-                    if len(column_content) != 0 and len(column_content) <= 25:
-                        all_column_contents.append(
-                            {
-                                "id": "{}-**-{}-**-{}".format(table_name, column_name, c_id).lower(),
-                                "contents": column_content
-                            }
-                        )
-            except Exception as e:
-                print(str(e))
 
-    os.makedirs('./data/temp_db_index', exist_ok = True)
-    
-    with open("./data/temp_db_index/contents.json", "w") as f:
-        f.write(json.dumps(all_column_contents, indent = 2, ensure_ascii = True))
+def main() -> None:
+    """
+    Main entry point: builds content indexes for predefined dataset directories.
+    """
+    # Example configurations; adjust paths as needed
+    configs = [
+        ('./data/sft_data_collections/bird/train/train_databases',
+         './data/sft_data_collections/bird/train/db_contents_index'),
+        ('./data/sft_data_collections/bird/dev/dev_databases',
+         './data/sft_data_collections/bird/dev/db_contents_index'),
+        ('./data/sft_data_collections/spider/database',
+         './data/sft_data_collections/spider/db_contents_index'),
+    ]
+    for db_root, idx_root in configs:
+        print(f"Preparing indices in {idx_root}")
+        prepare_indices(db_root, idx_root)
 
-    # Building a BM25 Index (Direct Java Implementation), see https://github.com/castorini/pyserini/blob/master/docs/usage-index.md
-    cmd = "python -m pyserini.index.lucene --collection JsonCollection --input ./data/temp_db_index --index {} --generator DefaultLuceneDocumentGenerator --threads 16 --storePositions --storeDocvectors --storeRaw".format(index_path)
-    
-    d = os.system(cmd)
-    print(d)
-    os.remove("./data/temp_db_index/contents.json")
-
-if __name__ == "__main__":
-    print("build content index for BIRD's training set databases...")
-    remove_contents_of_a_folder("./data/sft_data_collections/bird/train/db_contents_index")
-    # build content index for BIRD's training set databases
-    for db_id in os.listdir("./data/sft_data_collections/bird/train/train_databases"):
-        if db_id.endswith(".json"):
-            continue
-        print(db_id)
-        build_content_index(
-            os.path.join("./data/sft_data_collections/bird/train/train_databases/", db_id, db_id + ".sqlite"),
-            os.path.join("./data/sft_data_collections/bird/train/db_contents_index/", db_id)
-        )
-    
-    print("build content index for BIRD's dev set databases...")
-    remove_contents_of_a_folder("./data/sft_data_collections/bird/dev/db_contents_index")
-    # build content index for BIRD's dev set databases
-    for db_id in os.listdir("./data/sft_data_collections/bird/dev/dev_databases"):
-        print(db_id)
-        build_content_index(
-            os.path.join("./data/sft_data_collections/bird/dev/dev_databases/", db_id, db_id + ".sqlite"),
-            os.path.join("./data/sft_data_collections/bird/dev/db_contents_index/", db_id)
-        )
-
-    print("build content index for spider's databases...")
-    remove_contents_of_a_folder("./data/sft_data_collections/spider/db_contents_index")
-    # build content index for spider's databases
-    for db_id in os.listdir("./data/sft_data_collections/spider/database"):
-        print(db_id)
-        build_content_index(
-            os.path.join("./data/sft_data_collections/spider/database/", db_id, db_id + ".sqlite"),
-            os.path.join("./data/sft_data_collections/spider/db_contents_index/", db_id)
-        )
-    
-    print("build content index for Dr.Spider's 17 perturbation test sets...")
-    # build content index for Dr.Spider's 17 perturbation test sets
-    test_set_names = os.listdir("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data")
-    test_set_names.remove("Spider-dev")
-    for test_set_name in test_set_names:
-        if test_set_name.startswith("DB_"):
-            remove_contents_of_a_folder(os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, "db_contents_index"))
-            for db_id in os.listdir(os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, "database_post_perturbation")):
-                print(db_id)
-                build_content_index(
-                    os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, "database_post_perturbation", db_id, db_id + ".sqlite"),
-                    os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, "db_contents_index", db_id)
-                )
-        else:
-            remove_contents_of_a_folder(os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, "db_contents_index"))
-            for db_id in os.listdir(os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, "databases")):
-                if db_id in ["README.md", "database_original"]:
-                    continue
-                print(db_id)
-                build_content_index(
-                    os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, "databases", db_id, db_id + ".sqlite"),
-                    os.path.join("./data/sft_data_collections/diagnostic-robustness-text-to-sql/data/", test_set_name, "db_contents_index", db_id)
-                )
-    
-    print("build content index for Bank_Financials and Aminer_Simplified training set databases...")
-    remove_contents_of_a_folder("./data/sft_data_collections/domain_datasets/db_contents_index")
-    # build content index for Bank_Financials's training set databases
-    for db_id in os.listdir("./data/sft_data_collections/domain_datasets/databases"):
-        print(db_id)
-        build_content_index(
-            os.path.join("./data/sft_data_collections/domain_datasets/databases/", db_id, db_id + ".sqlite"),
-            os.path.join("./data/sft_data_collections/domain_datasets/db_contents_index/", db_id)
-        )
+if __name__ == '__main__':
+    main()
