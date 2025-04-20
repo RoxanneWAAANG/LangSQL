@@ -1,180 +1,254 @@
+# Attribution: Original code by Ruoxin Wang
+# Repository: https://github.com/RoxanneWAAANG/LangSQL
+
+"""
+Module: refactored_chatbot
+This module provides utilities for loading database schemas, extracting DDL,
+indexing content, and a ChatBot class to generate SQL queries from natural language.
+"""
 import os
 import json
-import torch
-import copy
 import re
-import sqlparse
 import sqlite3
-
+import copy
 from tqdm import tqdm
-from utils.db_utils import get_db_schema
+
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from pyserini.search.lucene import LuceneSearcher
-from utils.db_utils import check_sql_executability, get_matched_contents, get_db_schema_sequence, get_matched_content_sequence
+from whoosh import index
+
+from utils.db_utils import (
+    get_db_schema,
+    check_sql_executability,
+    get_matched_contents,
+    get_db_schema_sequence,
+    get_matched_content_sequence
+)
 from schema_item_filter import SchemaItemClassifierInference, filter_schema
 
-def remove_similar_comments(names, comments):
-    '''
-    Remove table (or column) comments that have a high degree of similarity with their names
-    
-    Arguments:
-        names: a list of table (or column) names
-        comments: a list of table (or column) comments
-    
-    Returns:
-        new_comments: a list of new table (or column) comments
-    '''
-    new_comments = []
-    for name, comment in zip(names, comments):    
-        if name.replace("_", "").replace(" ", "") == comment.replace("_", "").replace(" ", ""):
-            new_comments.append("")
-        else:
-            new_comments.append(comment)
-    
-    return new_comments
 
-def load_db_comments(table_json_path):
-    additional_db_info = json.load(open(table_json_path))
-    db_comments = dict()
-    for db_info in additional_db_info:
-        comment_dict = dict()
+class DatabaseUtils:
+    """
+    Utilities for loading database comments, schemas, and DDL statements.
+    """
 
-        column_names = [column_name.lower() for _, column_name in db_info["column_names_original"]]
-        table_idx_of_each_column = [t_idx for t_idx, _ in db_info["column_names_original"]]
-        column_comments = [column_comment.lower() for _, column_comment in db_info["column_names"]]
-        
-        assert len(column_names) == len(column_comments)
-        column_comments = remove_similar_comments(column_names, column_comments)
+    @staticmethod
+    def _remove_similar_comments(names, comments):
+        """
+        Remove comments identical to table/column names (ignoring underscores and spaces).
+        """
+        filtered = []
+        for name, comment in zip(names, comments):
+            normalized_name = name.replace("_", "").replace(" ", "").lower()
+            normalized_comment = comment.replace("_", "").replace(" ", "").lower()
+            filtered.append("") if normalized_name == normalized_comment else filtered.append(comment)
+        return filtered
 
-        table_names = [table_name.lower() for table_name in db_info["table_names_original"]]
-        table_comments = [table_comment.lower() for table_comment in db_info["table_names"]]
-        
-        assert len(table_names) == len(table_comments)
-        table_comments = remove_similar_comments(table_names, table_comments)
+    @staticmethod
+    def load_db_comments(table_json_path):
+        """
+        Load additional comments for tables and columns from a JSON file.
 
-        # enumerate each table and its columns
-        for table_idx, (table_name, table_comment) in enumerate(zip(table_names, table_comments)):
-            comment_dict[table_name] = {
-                "table_comment": table_comment,
-                "column_comments": dict()
-            }
-            for t_idx, column_name, column_comment in zip(table_idx_of_each_column, column_names, column_comments):
-                # record columns in current table
-                if t_idx == table_idx:
-                    comment_dict[table_name]["column_comments"][column_name] = column_comment
+        Args:
+            table_json_path (str): Path to JSON file containing table and column comments.
 
-        db_comments[db_info["db_id"]] = comment_dict
-    
-    return db_comments
+        Returns:
+            dict: Mapping from database ID to comments structure.
+        """
+        additional_info = json.load(open(table_json_path))
+        db_comments = {}
 
-def get_db_id2schema(db_path, tables_json):
-    db_comments = load_db_comments(tables_json)
-    db_id2schema = dict()
+        for db_info in additional_info:
+            db_id = db_info["db_id"]
+            comment_dict = {}
 
-    for db_id in tqdm(os.listdir(db_path)):
-        db_id2schema[db_id] = get_db_schema(os.path.join(db_path, db_id, db_id + ".sqlite"), db_comments, db_id)
-    
-    return db_id2schema
+            # Process column comments
+            original_cols = db_info["column_names_original"]
+            col_names = [col.lower() for _, col in original_cols]
+            col_comments = [c.lower() for _, c in db_info["column_names"]]
+            col_comments = DatabaseUtils._remove_similar_comments(col_names, col_comments)
+            col_table_idxs = [t_idx for t_idx, _ in original_cols]
 
-def get_db_id2ddl(db_path):
-    db_ids = os.listdir(db_path)
-    db_id2ddl = dict()
+            # Process table comments
+            original_tables = db_info["table_names_original"]
+            tbl_names = [tbl.lower() for tbl in original_tables]
+            tbl_comments = [c.lower() for c in db_info["table_names"]]
+            tbl_comments = DatabaseUtils._remove_similar_comments(tbl_names, tbl_comments)
 
-    for db_id in db_ids:
-        conn = sqlite3.connect(os.path.join(db_path, db_id, db_id + ".sqlite"))
-        cursor = conn.cursor()
-        cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table';")
-        tables = cursor.fetchall()
-        ddl = []
-        
-        for table in tables:
-            table_name = table[0]
-            table_ddl = table[1]
-            table_ddl.replace("\t", " ")
-            while "  " in table_ddl:
-                table_ddl = table_ddl.replace("  ", " ")
-            
-            # remove comments
-            table_ddl = re.sub(r'--.*', '', table_ddl)
+            for idx, name in enumerate(tbl_names):
+                comment_dict[name] = {
+                    "table_comment": tbl_comments[idx],
+                    "column_comments": {}
+                }
+                # Associate columns
+                for t_idx, col_name, col_comment in zip(col_table_idxs, col_names, col_comments):
+                    if t_idx == idx:
+                        comment_dict[name]["column_comments"][col_name] = col_comment
 
-            table_ddl = sqlparse.format(table_ddl, keyword_case = "upper", identifier_case = "lower", reindent_aligned = True)
-            table_ddl = table_ddl.replace(", ", ",\n    ")
-            
-            if table_ddl.endswith(";"):
-                table_ddl = table_ddl[:-1]
-            table_ddl = table_ddl[:-1] + "\n);"
-            table_ddl = re.sub(r"(CREATE TABLE.*?)\(", r"\1(\n    ", table_ddl)
+            db_comments[db_id] = comment_dict
 
-            ddl.append(table_ddl)
-        db_id2ddl[db_id] = "\n\n".join(ddl)
-    
-    return db_id2ddl
+        return db_comments
 
-class ChatBot():
-    def __init__(self) -> None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-        model_name = "seeklhy/codes-1b"
+    @staticmethod
+    def get_db_schemas(db_path, tables_json):
+        """
+        Build a mapping from database ID to its schema representation.
+
+        Args:
+            db_path (str): Directory containing database subdirectories.
+            tables_json (str): Path to JSON with table comments.
+
+        Returns:
+            dict: Mapping from db_id to schema object.
+        """
+        comments = DatabaseUtils.load_db_comments(tables_json)
+        schemas = {}
+        for db_id in tqdm(os.listdir(db_path), desc="Loading schemas"):
+            sqlite_path = os.path.join(db_path, db_id, f"{db_id}.sqlite")
+            schemas[db_id] = get_db_schema(sqlite_path, comments, db_id)
+        return schemas
+
+    @staticmethod
+    def get_db_ddls(db_path):
+        """
+        Extract formatted DDL statements for all tables in each database.
+
+        Args:
+            db_path (str): Directory containing database subdirectories.
+
+        Returns:
+            dict: Mapping from db_id to its DDL string.
+        """
+        ddls = {}
+        for db_id in os.listdir(db_path):
+            conn = sqlite3.connect(os.path.join(db_path, db_id, f"{db_id}.sqlite"))
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table';")
+            ddl_statements = []
+
+            for name, raw_sql in cursor.fetchall():
+                sql = raw_sql or ""
+                sql = re.sub(r'--.*', '', sql).replace("\t", " ")
+                sql = re.sub(r" +", " ", sql)
+                formatted = sqlparse.format(
+                    sql,
+                    keyword_case="upper",
+                    identifier_case="lower",
+                    reindent_aligned=True
+                )
+                # Adjust spacing for readability
+                formatted = formatted.replace(", ", ",\n    ")
+                if formatted.rstrip().endswith(";"):
+                    formatted = formatted.rstrip()[:-1] + "\n);"
+                formatted = re.sub(r"(CREATE TABLE.*?)\(", r"\1(\n    ", formatted)
+                ddl_statements.append(formatted)
+
+            ddls[db_id] = "\n\n".join(ddl_statements)
+        return ddls
+
+
+class ChatBot:
+    """
+    ChatBot for generating and executing SQL queries using a causal language model.
+    """
+
+    def __init__(self, model_name: str = "seeklhy/codes-1b", device: str = "cuda:0") -> None:
+        """
+        Initialize the ChatBot with model and tokenizer.
+
+        Args:
+            model_name (str): HuggingFace model identifier.
+            device (str): CUDA device string or 'cpu'.
+        """
+        os.environ["CUDA_VISIBLE_DEVICES"] = device
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, device_map = "auto", torch_dtype = torch.float16)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            torch_dtype=torch.float16
+        )
         self.max_length = 4096
         self.max_new_tokens = 256
         self.max_prefix_length = self.max_length - self.max_new_tokens
 
-        self.sic = SchemaItemClassifierInference("/home/jack/Projects/yixin-llm/yixin-llm-data/Text2SQL/sic_ckpts/sic_spider")
+        # Schema item classifier
+        self.schema_classifier = SchemaItemClassifierInference("Roxanne-WANG/LangSQL")
 
-        self.db_id2content_searcher = dict()
-        for db_id in os.listdir("db_contents_index"):
-            self.db_id2content_searcher[db_id] = LuceneSearcher(os.path.join("db_contents_index", db_id))
-        
+        # Initialize content searchers
+        self.content_searchers = {}
+        index_dir = "db_contents_index"
+        for db_id in os.listdir(index_dir):
+            path = os.path.join(index_dir, db_id)
+            if index.exists_in(path):
+                self.content_searchers[db_id] = index.open_dir(path).searcher()
+            else:
+                raise FileNotFoundError(f"Whoosh index not found for '{db_id}' at '{path}'")
+
+        # Load schemas and DDLs
         self.db_ids = sorted(os.listdir("databases"))
-        self.db_id2schema = get_db_id2schema("databases", "data/tables.json")
-        self.db_id2ddl = get_db_id2ddl("databases")
+        self.schemas = DatabaseUtils.get_db_schemas("databases", "data/tables.json")
+        self.ddls = DatabaseUtils.get_db_ddls("databases")
 
-    def get_response(self, question, db_id):
+    def get_response(self, question: str, db_id: str) -> str:
+        """
+        Generate an executable SQL query for a natural language question.
+
+        Args:
+            question (str): User question in natural language.
+            db_id (str): Identifier of the target database.
+
+        Returns:
+            str: Executable SQL query or an error message.
+        """
+        # Prepare data
+        schema = copy.deepcopy(self.schemas[db_id])
+        contents = get_matched_contents(question, self.content_searchers[db_id])
         data = {
             "text": question,
-            "schema": copy.deepcopy(self.db_id2schema[db_id]),
-            "matched_contents": get_matched_contents(question, self.db_id2content_searcher[db_id])
+            "schema": schema,
+            "matched_contents": contents
         }
-        data = filter_schema(data, self.sic, 6, 10)
+        data = filter_schema(data, self.schema_classifier, top_k=6, top_m=10)
         data["schema_sequence"] = get_db_schema_sequence(data["schema"])
         data["content_sequence"] = get_matched_content_sequence(data["matched_contents"])
-        
-        prefix_seq = data["schema_sequence"] + "\n" + data["content_sequence"] + "\n" + data["text"] + "\n"
-        print(prefix_seq)
-        
-        input_ids = [self.tokenizer.bos_token_id] + self.tokenizer(prefix_seq , truncation = False)["input_ids"]
+
+        prefix = (
+            f"{data['schema_sequence']}\n"
+            f"{data['content_sequence']}\n"
+            f"{question}\n"
+        )
+
+        # Tokenize and ensure length limits
+        input_ids = [self.tokenizer.bos_token_id] + self.tokenizer(prefix)["input_ids"]
         if len(input_ids) > self.max_prefix_length:
-            print("the current input sequence exceeds the max_tokens, we will truncate it.")
-            input_ids = [self.tokenizer.bos_token_id] + input_ids[-(self.max_prefix_length-1):]
+            input_ids = [self.tokenizer.bos_token_id] + input_ids[-(self.max_prefix_length - 1):]
         attention_mask = [1] * len(input_ids)
-        
+
         inputs = {
-            "input_ids": torch.tensor([input_ids], dtype = torch.int64).to(self.model.device),
-            "attention_mask": torch.tensor([attention_mask], dtype = torch.int64).to(self.model.device)
+            "input_ids": torch.tensor([input_ids], dtype=torch.int64).to(self.model.device),
+            "attention_mask": torch.tensor([attention_mask], dtype=torch.int64).to(self.model.device)
         }
-        input_length = inputs["input_ids"].shape[1]
 
         with torch.no_grad():
-            generate_ids = self.model.generate(
+            outputs = self.model.generate(
                 **inputs,
-                max_new_tokens = self.max_new_tokens,
-                num_beams = 4,
-                num_return_sequences = 4
+                max_new_tokens=self.max_new_tokens,
+                num_beams=4,
+                num_return_sequences=4
             )
 
-        generated_sqls = self.tokenizer.batch_decode(generate_ids[:, input_length:], skip_special_tokens = True, clean_up_tokenization_spaces = False)
-        final_generated_sql = None
-        for generated_sql in generated_sqls:
-            execution_error = check_sql_executability(generated_sql, os.path.join("databases", db_id, db_id + ".sqlite"))
-            if execution_error is None: # the generated sql has no execution errors, we will return it as the final generated sql
-                final_generated_sql = generated_sql
+        # Decode and choose executable SQL
+        decoded = self.tokenizer.batch_decode(
+            outputs[:, inputs['input_ids'].shape[1]:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )
+        final_sql = None
+        for sql in decoded:
+            if check_sql_executability(sql, os.path.join("databases", db_id, f"{db_id}.sqlite")) is None:
+                final_sql = sql.strip()
                 break
+        if not final_sql:
+            final_sql = decoded[0].strip() or "Sorry, I cannot generate a suitable SQL query."
 
-        if final_generated_sql is None:
-            if generated_sqls[0].strip() != "":
-                final_generated_sql = generated_sqls[0].strip()
-            else:
-                final_generated_sql = "Sorry, I can not generate a suitable SQL query for your question."
-        
-        return final_generated_sql.replace("\n", " ")
+        return final_sql

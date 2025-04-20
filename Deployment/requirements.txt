@@ -3,14 +3,10 @@ text2sql==0.1.0
 langdetect==1.0.9
 flask==2.2.2
 gradio==3.11.0
-requests
-websocket-client
-python-socketio
-eventlet
-langdetect
+langdetect==1.0.9 
 func_timeout==4.3.5
 nltk==3.7
-numpy
+numpy==1.23.5
 pandas==2.0.1
 rapidfuzz==2.0.11
 tqdm==4.63.0
@@ -19,7 +15,6 @@ chardet==5.2.0
 sqlparse==0.4.4
 accelerate==0.22.0
 bitsandbytes==0.41.1
-pyserini
 sql_metadata==2.8.0
 datasets==2.11.0
-faiss-cpu==1.7.4
+whoosh==2.7.4

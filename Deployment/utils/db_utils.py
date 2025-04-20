@@ -1,255 +1,346 @@
+# Attribution: Original code by RUCKBReasoning
+# Repository: https://github.com/RUCKBReasoning/codes
+
+"""
+Module: db_utils
+Provides utilities for history logging, SQL execution with timeouts, content matching, and schema extraction for Text-to-SQL.
+"""
 import os
 import json
 import sqlite3
+from typing import List, Tuple, Dict, Any
 
 from func_timeout import func_set_timeout, FunctionTimedOut
-from utils.bridge_content_encoder import get_matched_entries
 from nltk.tokenize import word_tokenize
 from nltk import ngrams
+from whoosh.qparser import QueryParser
 
-def add_a_record(question, db_id):
-    conn = sqlite3.connect('data/history/history.sqlite')
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO record (question, db_id) VALUES (?, ?)", (question, db_id))
+from utils.bridge_content_encoder import get_matched_entries
 
-    conn.commit()
-    conn.close()
 
-def obtain_n_grams(sequence, max_n):
-    tokens = word_tokenize(sequence)
-    all_grams = []
-    for n in range(1, max_n + 1):
-        all_grams.extend([" ".join(gram) for gram in ngrams(tokens, n)])
-    
-    return all_grams
+class HistoryLogger:
+    """
+    Log user queries into a SQLite history database.
+    """
 
-# get the database cursor for a sqlite database path
-def get_cursor_from_path(sqlite_path):
-    try:
+    DB_PATH = 'data/history/history.sqlite'
+
+    @staticmethod
+    def add_record(question: str, db_id: str) -> None:
+        """
+        Insert a new query record into the history database.
+
+        Args:
+            question: The user's natural-language question.
+            db_id: Identifier of the target database.
+        """
+        conn = sqlite3.connect(HistoryLogger.DB_PATH)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO record (question, db_id) VALUES (?, ?)",
+                (question, db_id)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+class SQLExecutor:
+    """
+    Execute SQL queries with optional time limits and error handling.
+    """
+
+    @staticmethod
+    def _get_cursor(sqlite_path: str) -> sqlite3.Cursor:
+        """
+        Create or retrieve a SQLite cursor for the given path.
+
+        Args:
+            sqlite_path: Filesystem path to the .sqlite file.
+
+        Returns:
+            sqlite3.Cursor with text_factory to ignore decode errors.
+        """
         if not os.path.exists(sqlite_path):
-            print("Openning a new connection %s" % sqlite_path)
-        connection = sqlite3.connect(sqlite_path, check_same_thread = False)
-    except Exception as e:
-        print(sqlite_path)
-        raise e
-    connection.text_factory = lambda b: b.decode(errors="ignore")
-    cursor = connection.cursor()
-    return cursor
+            print(f"Opening new connection: {sqlite_path}")
+        conn = sqlite3.connect(sqlite_path, check_same_thread=False)
+        conn.text_factory = lambda b: b.decode(errors='ignore')
+        return conn.cursor()
 
-# execute predicted sql with a time limitation
-@func_set_timeout(15)
-def execute_sql(cursor, sql):
-    cursor.execute(sql)
+    @staticmethod
+    @func_set_timeout(15)
+    def execute(cursor: sqlite3.Cursor, sql: str) -> List[Tuple]:
+        """
+        Execute a SQL statement with a short timeout.
 
-    return cursor.fetchall()
+        Args:
+            cursor: SQLite cursor.
+            sql: SQL string to execute.
 
-# execute predicted sql with a long time limitation (for buiding content index)
-@func_set_timeout(2000)
-def execute_sql_long_time_limitation(cursor, sql):
-    cursor.execute(sql)
+        Returns:
+            List of result tuples.
 
-    return cursor.fetchall()
+        Raises:
+            FunctionTimedOut if execution exceeds 15 seconds.
+        """
+        cursor.execute(sql)
+        return cursor.fetchall()
 
-def check_sql_executability(generated_sql, db):
-    if generated_sql.strip() == "":
-        return "Error: empty string"
-    try:
-        cursor = get_cursor_from_path(db)
-        execute_sql(cursor, generated_sql)
-        execution_error = None
-    except FunctionTimedOut as fto:
-        print("SQL execution time out error: {}.".format(fto))
-        execution_error = "SQL execution times out."
-    except Exception as e:
-        print("SQL execution runtime error: {}.".format(e))
-        execution_error = str(e)
-    
-    return execution_error
+    @staticmethod
+    @func_set_timeout(2000)
+    def execute_long(cursor: sqlite3.Cursor, sql: str) -> List[Tuple]:
+        """
+        Execute a SQL statement with a longer timeout (for indexing).
+        """
+        cursor.execute(sql)
+        return cursor.fetchall()
 
-def is_number(s):
-    try:
-        float(s)
-        return True
-    except ValueError:
-        return False
+    @staticmethod
+    def check_executability(generated_sql: str, db_path: str) -> Any:
+        """
+        Check if a SQL query runs without error or timeout.
 
-def detect_special_char(name):
-    for special_char in ['(', '-', ')', ' ', '/']:
-        if special_char in name:
-            return True
+        Args:
+            generated_sql: The SQL query string.
+            db_path: Path to the SQLite database.
 
-    return False
+        Returns:
+            None if successful, or an error message string.
+        """
+        sql = generated_sql.strip()
+        if not sql:
+            return "Error: empty query"
+        try:
+            cursor = SQLExecutor._get_cursor(db_path)
+            SQLExecutor.execute(cursor, sql)
+            return None
+        except FunctionTimedOut:
+            return "Error: execution timed out"
+        except Exception as e:
+            return str(e)
 
-def add_quotation_mark(s):
-    return "`" + s + "`"
 
-def get_column_contents(column_name, table_name, cursor):
-    select_column_sql = "SELECT DISTINCT `{}` FROM `{}` WHERE `{}` IS NOT NULL LIMIT 2;".format(column_name, table_name, column_name)
-    results = execute_sql_long_time_limitation(cursor, select_column_sql)
-    column_contents = [str(result[0]).strip() for result in results]
-    # remove empty and extremely-long contents
-    column_contents = [content for content in column_contents if len(content) != 0 and len(content) <= 25]
+class ContentMatcher:
+    """
+    Extract and match content snippets from database columns using n-grams and Whoosh.
+    """
 
-    return column_contents
+    @staticmethod
+    def obtain_n_grams(text: str, max_n: int) -> List[str]:
+        """
+        Generate all n-grams up to max_n from the input text.
 
-def get_matched_contents(question, searcher):
-    # coarse-grained matching between the input text and all contents in database
-    grams = obtain_n_grams(question, 4)
-    hits = []
-    for query in grams:
-        hits.extend(searcher.search(query, k = 10))
-    
-    coarse_matched_contents = dict()
-    for i in range(len(hits)):
-        matched_result = json.loads(hits[i].raw)
-        # `tc_name` refers to column names like `table_name.column_name`, e.g., document_drafts.document_id
-        tc_name = ".".join(matched_result["id"].split("-**-")[:2])
-        if tc_name in coarse_matched_contents.keys():
-            if matched_result["contents"] not in coarse_matched_contents[tc_name]:
-                coarse_matched_contents[tc_name].append(matched_result["contents"])
-        else:
-            coarse_matched_contents[tc_name] = [matched_result["contents"]]
-    
-    fine_matched_contents = dict()
-    for tc_name, contents in coarse_matched_contents.items():
-        # fine-grained matching between the question and coarse matched contents
-        fm_contents = get_matched_entries(question, contents)
-        
-        if fm_contents is None:
-            continue
-        for _match_str, (field_value, _s_match_str, match_score, s_match_score, _match_size,) in fm_contents:
-            if match_score < 0.9:
+        Args:
+            text: Input string to tokenize.
+            max_n: Maximum n-gram length.
+
+        Returns:
+            List of n-gram strings.
+        """
+        # Ensure tokenizers are downloaded
+        import nltk
+        nltk.download('punkt', quiet=True)
+
+        tokens = word_tokenize(text)
+        grams = []
+        for n in range(1, max_n + 1):
+            grams += [' '.join(gram) for gram in ngrams(tokens, n)]
+        return grams
+
+    @staticmethod
+    def get_matched_contents(
+        question: str,
+        searcher
+    ) -> Dict[str, List[str]]:
+        """
+        Perform coarse and fine-grained matching of question against indexed content.
+
+        Args:
+            question: User query.
+            searcher: Whoosh Index searcher instance.
+
+        Returns:
+            Mapping from 'table.column' to matched values.
+        """
+        # Coarse matching via n-grams
+        grams = ContentMatcher.obtain_n_grams(question, 4)
+        coarse: Dict[str, List[str]] = {}
+
+        for gram in grams:
+            qp = QueryParser('content', schema=searcher.schema)
+            q = qp.parse(gram)
+            for hit in searcher.search(q, limit=10):
+                entry = json.loads(hit.raw)
+                tc = '.'.join(entry['id'].split('-')[:2])
+                coarse.setdefault(tc, []).append(entry['contents'])
+
+        # Fine-grained filtering
+        fine: Dict[str, List[str]] = {}
+        for tc, vals in coarse.items():
+            fm = get_matched_entries(question, vals)
+            if not fm:
                 continue
-            if tc_name in fine_matched_contents.keys():
-                if len(fine_matched_contents[tc_name]) < 25:
-                    fine_matched_contents[tc_name].append(field_value.strip())
-            else:
-                fine_matched_contents[tc_name] = [field_value.strip()]
+            for match_str, (value, _, score, _, _) in fm:
+                if score >= 0.9:
+                    fine.setdefault(tc, []).append(value.strip())
+                    if len(fine[tc]) >= 25:
+                        break
+        return fine
 
-    return fine_matched_contents
 
-def get_db_schema_sequence(schema):
-    schema_sequence = "database schema :\n"
-    for table in schema["schema_items"]:
-        table_name, table_comment = table["table_name"], table["table_comment"]
-        if detect_special_char(table_name):
-            table_name = add_quotation_mark(table_name)
-        
-        # if table_comment != "":
-        #     table_name += " ( comment : " + table_comment + " )"
+class SchemaBuilder:
+    """
+    Extract schema details and format sequences for model prompting.
+    """
 
-        column_info_list = []
-        for column_name, column_type, column_comment, column_content, pk_indicator in \
-            zip(table["column_names"], table["column_types"], table["column_comments"], table["column_contents"], table["pk_indicators"]):
-            if detect_special_char(column_name):
-                column_name = add_quotation_mark(column_name)
-            additional_column_info = []
-            # column type
-            additional_column_info.append(column_type)
-            # pk indicator
-            if pk_indicator != 0:
-                additional_column_info.append("primary key")
-            # column comment
-            if column_comment != "":
-                additional_column_info.append("comment : " + column_comment)
-            # representive column values
-            if len(column_content) != 0:
-                additional_column_info.append("values : " + " , ".join(column_content))
-            
-            column_info_list.append(table_name + "." + column_name + " ( " + " | ".join(additional_column_info) + " )")
-        
-        schema_sequence += "table "+ table_name + " , columns = [ " + " , ".join(column_info_list) + " ]\n"
+    @staticmethod
+    def detect_special_char(name: str) -> bool:
+        """
+        Check if a name contains schema-special characters.
+        """
+        return any(c in name for c in ['(', ')', '-', ' ', '/'])
 
-    if len(schema["foreign_keys"]) != 0:
-        schema_sequence += "foreign keys :\n"
-        for foreign_key in schema["foreign_keys"]:
-            for i in range(len(foreign_key)):
-                if detect_special_char(foreign_key[i]):
-                    foreign_key[i] = add_quotation_mark(foreign_key[i])
-            schema_sequence += "{}.{} = {}.{}\n".format(foreign_key[0], foreign_key[1], foreign_key[2], foreign_key[3])
-    else:
-        schema_sequence += "foreign keys : None\n"
+    @staticmethod
+    def quote(name: str) -> str:
+        """
+        Wrap a name in backticks for SQL.
+        """
+        return f'`{name}`'
 
-    return schema_sequence.strip()
+    @staticmethod
+    def get_column_contents(
+        column: str,
+        table: str,
+        cursor: sqlite3.Cursor
+    ) -> List[str]:
+        """
+        Retrieve example values for a column (max 2) and filter short strings.
+        """
+        sql = f"SELECT DISTINCT `{column}` FROM `{table}` WHERE `{column}` IS NOT NULL LIMIT 2;"
+        rows = SQLExecutor.execute_long(cursor, sql)
+        return [str(r[0]).strip() for r in rows if 0 < len(str(r[0]).strip()) <= 25]
 
-def get_matched_content_sequence(matched_contents):
-    content_sequence = ""
-    if len(matched_contents) != 0:
-        content_sequence += "matched contents :\n"
-        for tc_name, contents in matched_contents.items():
-            table_name = tc_name.split(".")[0]
-            column_name = tc_name.split(".")[1]
-            if detect_special_char(table_name):
-                table_name = add_quotation_mark(table_name)
-            if detect_special_char(column_name):
-                column_name = add_quotation_mark(column_name)
-            
-            content_sequence += table_name + "." + column_name + " ( " + " , ".join(contents) + " )\n"
-    else:
-        content_sequence = "matched contents : None"
-    
-    return content_sequence.strip()
+    @staticmethod
+    def build_schema_sequence(
+        schema: Dict[str, Any]
+    ) -> str:
+        """
+        Format the schema dict into a prompt string for the LLM.
+        """
+        seq = ['database schema:']
+        for item in schema['schema_items']:
+            tbl = item['table_name']
+            if SchemaBuilder.detect_special_char(tbl):
+                tbl = SchemaBuilder.quote(tbl)
+            cols_info = []
+            for col, typ, com, cont, pk in zip(
+                item['column_names'],
+                item['column_types'],
+                item['column_comments'],
+                item['column_contents'],
+                item['pk_indicators']
+            ):
+                if SchemaBuilder.detect_special_char(col):
+                    col = SchemaBuilder.quote(col)
+                info = [typ]
+                if pk:
+                    info.append('primary key')
+                if com:
+                    info.append(f'comment: {com}')
+                if cont:
+                    info.append('values: ' + ', '.join(cont))
+                cols_info.append(f"{tbl}.{col} ({' | '.join(info)})")
+            seq.append(f"table {tbl}, columns=[{'; '.join(cols_info)}]")
 
-def get_db_schema(db_path, db_comments, db_id):
-    if db_id in db_comments:
-        db_comment = db_comments[db_id]
-    else:
-        db_comment = None
+        fks = schema.get('foreign_keys', [])
+        if fks:
+            seq.append('foreign keys:')
+            for src_tbl, src_col, tgt_tbl, tgt_col in fks:
+                seq.append(f"{src_tbl}.{src_col} = {tgt_tbl}.{tgt_col}")
+        else:
+            seq.append('foreign keys: None')
 
-    cursor = get_cursor_from_path(db_path)
-    
-    # obtain table names
-    results = execute_sql(cursor, "SELECT name FROM sqlite_master WHERE type='table';")
-    table_names = [result[0].lower() for result in results]
+        return '\n'.join(seq)
 
-    schema = dict()
-    schema["schema_items"] = []
-    foreign_keys = []
-    # for each table
-    for table_name in table_names:
-        # skip SQLite system table: sqlite_sequence
-        if table_name == "sqlite_sequence":
-            continue
-        # obtain column names in the current table
-        results = execute_sql(cursor, "SELECT name, type, pk FROM PRAGMA_TABLE_INFO('{}')".format(table_name))
-        column_names_in_one_table = [result[0].lower() for result in results]
-        column_types_in_one_table = [result[1].lower() for result in results]
-        pk_indicators_in_one_table = [result[2] for result in results]
+    @staticmethod
+    def build_content_sequence(
+        matched: Dict[str, List[str]]
+    ) -> str:
+        """
+        Format matched contents into a prompt string.
+        """
+        if not matched:
+            return 'matched contents: None'
+        lines = ['matched contents:']
+        for tc, vals in matched.items():
+            tbl, col = tc.split('.')
+            if SchemaBuilder.detect_special_char(tbl):
+                tbl = SchemaBuilder.quote(tbl)
+            if SchemaBuilder.detect_special_char(col):
+                col = SchemaBuilder.quote(col)
+            lines.append(f"{tbl}.{col} ({', '.join(vals)})")
+        return '\n'.join(lines)
 
-        column_contents = []
-        for column_name in column_names_in_one_table:
-            column_contents.append(get_column_contents(column_name, table_name, cursor))
-        
-        # obtain foreign keys in the current table
-        results = execute_sql(cursor, "SELECT * FROM pragma_foreign_key_list('{}');".format(table_name))
-        for result in results:
-            if None not in [result[3], result[2], result[4]]:
-                foreign_keys.append([table_name.lower(), result[3].lower(), result[2].lower(), result[4].lower()])
-        
-        # obtain comments for each schema item
-        if db_comment is not None:
-            if table_name in db_comment: # record comments for tables and columns
-                table_comment = db_comment[table_name]["table_comment"]
-                column_comments = [db_comment[table_name]["column_comments"][column_name] \
-                    if column_name in db_comment[table_name]["column_comments"] else "" \
-                        for column_name in column_names_in_one_table]
-            else: # current database has comment information, but the current table does not
-                table_comment = ""
-                column_comments = ["" for _ in column_names_in_one_table]
-        else: # current database has no comment information
-            table_comment = ""
-            column_comments = ["" for _ in column_names_in_one_table]
 
-        schema["schema_items"].append({
-            "table_name": table_name,
-            "table_comment": table_comment,
-            "column_names": column_names_in_one_table,
-            "column_types": column_types_in_one_table,
-            "column_comments": column_comments,
-            "column_contents": column_contents,
-            "pk_indicators": pk_indicators_in_one_table
+def get_db_schema(
+    db_path: str,
+    comments: Dict[str, Any],
+    db_id: str
+) -> Dict[str, Any]:
+    """
+    Load table/column metadata and comments from a SQLite DB into a schema dict.
+
+    Args:
+        db_path: Path to the .sqlite file.
+        comments: Mapping of db_id to comment structures.
+        db_id: Identifier for looking up comments.
+
+    Returns:
+        Schema dictionary with items and foreign_keys.
+    """
+    db_comment = comments.get(db_id, {})
+    cursor = SQLExecutor._get_cursor(db_path)
+
+    # Retrieve table names
+    tables = SQLExecutor.execute(cursor, "SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [r[0].lower() for r in tables if r[0].lower() != 'sqlite_sequence']
+
+    schema = {'schema_items': [], 'foreign_keys': []}
+    for tbl in tables:
+        # Columns
+        cols_info = SQLExecutor.execute(cursor, f"PRAGMA table_info('{tbl}')")
+        col_names = [r[1].lower() for r in cols_info]
+        col_types = [r[2].lower() for r in cols_info]
+        pk_inds  = [r[5] for r in cols_info]
+
+        # Contents
+        col_contents = [
+            SchemaBuilder.get_column_contents(col, tbl, cursor)
+            for col in col_names
+        ]
+
+        # Foreign keys
+        fks = SQLExecutor.execute(cursor, f"PRAGMA foreign_key_list('{tbl}');")
+        for fk in fks:
+            schema['foreign_keys'].append([
+                tbl, fk[3].lower(), fk[2].lower(), fk[4].lower()
+            ])
+
+        # Comments
+        tbl_comm = db_comment.get(tbl, {}).get('table_comment', '')
+        col_comms = [
+            db_comment.get(tbl, {}).get('column_comments', {}).get(col, '')
+            for col in col_names
+        ]
+
+        schema['schema_items'].append({
+            'table_name': tbl,
+            'table_comment': tbl_comm,
+            'column_names': col_names,
+            'column_types': col_types,
+            'column_comments': col_comms,
+            'column_contents': col_contents,
+            'pk_indicators': pk_inds
         })
-    
-    schema["foreign_keys"] = foreign_keys
-    
     return schema
