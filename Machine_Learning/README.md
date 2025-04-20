@@ -19,7 +19,7 @@ To train the model on a custom dataset, use the following command:
 ```python
 from ml_text2sql import ML_Text2SQL
 
-data_path = "/path/to/your/training_data.json"
+data_path = "dataset/sample_spider_data.json"
 model_save_path = "ml_text2sql_model.pkl"
 
 # Load data
@@ -88,7 +88,4 @@ model.save_model("ml_text2sql_model.pkl")
 loaded_model = ML_Text2SQL.load_model("ml_text2sql_model.pkl")
 ```
 
-## Files
-- **ml_text2sql.py**: Main code for training, predicting, and saving the model.
-- **evaluation_results.json**: Stores the evaluation results of the model on the test dataset.
 

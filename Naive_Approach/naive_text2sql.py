@@ -1,3 +1,6 @@
+# Attribution: Original code by Ruoxin Wang
+# Repository: https://github.com/RoxanneWAAANG/LangSQL
+
 import json
 import os
 import re
@@ -131,7 +134,7 @@ class NaiveText2SQL:
 # Example usage
 if __name__ == "__main__":
     # Load sample data
-    with open("/home/jack/Projects/yixin-llm/yixin-llm-data/Text2SQL/data/sft_spider_dev_text2sql.json", "r") as f:
+    with open("dataset/sample_spider_data.json", "r") as f:
         data = json.load(f)
     
     # Create the naive model
