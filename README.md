@@ -1,7 +1,7 @@
 # Text2SQL
 
-Demo Website: https://huggingface.co/spaces/Roxanne-WANG/LangSQL
-Demo Video: 
+#### Demo Website: https://huggingface.co/spaces/Roxanne-WANG/LangSQL
+##### Demo Video: 
 
 ## Project Description
 The Text-to-SQL Module Project addresses the challenge of bridging the gap between non‑technical users and relational databases by translating natural language questions into executable SQL queries. By providing an intuitive interface, this system empowers stakeholders—such as business analysts, researchers, and educators—to interact with complex data without requiring deep SQL proficiency or programming knowledge.
