@@ -15,10 +15,7 @@ In this project, I leverage [CodeS-1B](https://huggingface.co/seeklhy/codes-1b),
 
 ### 1. **Downloading the Data and Checkpoints**
 
-Download the required datasets and model checkpoints:
-
-- [Data](https://drive.google.com/file/d/189spLXUL3gF8k4sny5qiWMqW3wOzx5AD/view?usp=sharing)
-- [Schema Item Classifier Checkpoints](https://drive.google.com/file/d/1V3F4ihTSPbV18g3lrg94VMH-kbWR_-lY/view?usp=sharing)
+Download the required [Datasets](https://drive.google.com/file/d/189spLXUL3gF8k4sny5qiWMqW3wOzx5AD/view?usp=sharing) and [Schema Item Classifier Checkpoints](https://drive.google.com/file/d/1V3F4ihTSPbV18g3lrg94VMH-kbWR_-lY/view?usp=sharing):
 
 Unzip these files:
 
