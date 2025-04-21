@@ -1,4 +1,4 @@
-# Text2SQL
+# LangSQL -- From Plain Text to SQL
 
 #### Demo Website: https://huggingface.co/spaces/Roxanne-WANG/LangSQL
 #### Demo Video: 
