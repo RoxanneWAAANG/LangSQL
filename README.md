@@ -126,7 +126,7 @@ Below is a brief introduction to each approach along with their primary requirem
 
 ## Ethical Statement
 
-This project has been designed with the following ethical considerations in mind:
+This project has been designed with the following ethical considerations:
 
 - **Data Privacy**: Ensure that no sensitive or personal data is exposed. All data used in training and evaluation is sourced from publicly available or properly anonymized datasets.
 - **Bias and Fairness**: Assess and mitigate potential biases in model predictions across different groups. Performance metrics will be reported separately for key subpopulations to ensure equitable behavior.
@@ -135,7 +135,7 @@ This project has been designed with the following ethical considerations in mind
 
 ## License
 
-This repository is released under the Apache License 2.0, following the same licensing as the CodeS.
+This repository is released under the Apache License 2.0, following the same licensing as the [CodeS](https://arxiv.org/abs/2402.16347).
 
 --- 
 _Some Sections of the README are re-articulated using ChatGPT._
