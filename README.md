@@ -1,7 +1,8 @@
 # LangSQL -- From Plain Text to SQL
 
 #### Demo Website: https://huggingface.co/spaces/Roxanne-WANG/LangSQL
-#### Demo Video: 
+#### Demo Video: https://youtu.be/Ok4EsmQ989E
+#### Slides: https://docs.google.com/presentation/d/1bMqIfBbwgNeu6jEoU2rnFP67V3qy3C6psLlQbWDlJkE/edit?usp=sharing
 
 ## Project Description
 The Text-to-SQL Module Project addresses the challenge of bridging the gap between non‑technical users and relational databases by translating natural language questions into executable SQL queries. By providing an intuitive interface, this system empowers stakeholders—such as business analysts, researchers, and educators—to interact with complex data without requiring deep SQL proficiency or programming knowledge.
