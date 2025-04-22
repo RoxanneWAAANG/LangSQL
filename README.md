@@ -22,8 +22,8 @@ At a high level, the system comprises three core stages:
    ```
 2. **Create and activate a virtual environment:**
    ```bash
-   conda create -n codes
-   conda activate codes
+   conda create -n langsql
+   conda activate langsql
    ```
 3. **Install dependencies:**
    ```bash
